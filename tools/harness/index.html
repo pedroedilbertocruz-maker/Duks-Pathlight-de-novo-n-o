@@ -72,11 +72,17 @@ const BOXES = [
   { min: [-110, 0, -330], max: [-30, 190, -250], albedo: [0.75, 0.75, 0.75] },
   { min: [30, 0, -250], max: [130, 100, -150], albedo: [0.65, 0.65, 0.7] },
 ];
+const CAVE_BOXES = [
+  { min: [-110, 0, -330], max: [-30, 300, -250], albedo: [0.62, 0.58, 0.52] },
+  { min: [30, 0, -250], max: [130, 100, -150], albedo: [0.55, 0.52, 0.5] },
+];
 const LIGHT = [0, 288, -250];
 const LAMP = { min: [-60, 299, -300], max: [60, 301, -200] };
 const ROOM = { x0: -200, x1: 200, y0: 0, y1: 300, z0: -400 };
 let OPEN = false;
-const WALL_COL = { left: [0.85, 0.12, 0.1], right: [0.12, 0.7, 0.15], other: [0.78, 0.78, 0.78] };
+const WALL_COL_CORNELL = { left: [0.85, 0.12, 0.1], right: [0.12, 0.7, 0.15], other: [0.78, 0.78, 0.78] };
+const WALL_COL_CAVE = { left: [0.5, 0.45, 0.4], right: [0.45, 0.45, 0.5], other: [0.5, 0.47, 0.42] };
+let WALL_COL = WALL_COL_CORNELL;
 
 function rayBox(o, d, mn, mx) {
   let t0 = 0, t1 = Infinity, nAxis = -1, nSign = 0;
@@ -98,7 +104,22 @@ function shadowed(p, n) {
   for (const b of BOXES) { const h = rayBox(o, d, b.min, b.max); if (h && h.t < dist) return true; }
   return false;
 }
+let SCENE = 'cornell';
+let TORCHES = [];
+function torchAtt(d2, r) { const x = d2 / (r*r); if (x >= 1) return 0; const w = 1 - x, core = r * 0.22; return w*w*core*core/(d2+core*core); }
 function shade(p, n, albedo) {
+  if (SCENE === 'cave') {
+    // What the original game would render: flat dim ambient + unshadowed per-light lighting.
+    const lin = [0, 0, 0];
+    for (const t of TORCHES) {
+      const L = v3.sub(t.pos, p); const d2 = v3.dot(L, L); if (d2 >= t.radius * t.radius) continue;
+      const ld = v3.mul(L, 1/Math.sqrt(d2)); const lam = Math.max(v3.dot(n, ld), 0);
+      const a = torchAtt(d2, t.radius) * lam * 0.9;
+      for (let k = 0; k < 3; k++) lin[k] += t.color[k] * a;
+    }
+    const out = albedo.map((al, k) => al * (0.34 + lin[k]));
+    return out.map(x => Math.min(1, Math.max(0, x)));
+  }
   const L = v3.sub(LIGHT, p); const dist = Math.hypot(...L); const ld = v3.mul(L, 1/dist);
   let lam = Math.max(v3.dot(n, ld), 0);
   if (lam > 0 && shadowed(p, n)) lam = 0;
@@ -120,7 +141,7 @@ function renderGBuffer(cam) {
     if (dir[0] > 0) consider((ROOM.x1 - cam.eye[0]) / dir[0], [-1,0,0], WALL_COL.right);
     if (dir[2] < 0) consider((ROOM.z0 - cam.eye[2]) / dir[2], [0,0,1], WALL_COL.other);
     for (const b of BOXES) { const h = rayBox(cam.eye, dir, b.min, b.max); if (h) consider(h.t, h.n, b.albedo); }
-    const lamp = rayBox(cam.eye, dir, LAMP.min, LAMP.max); if (lamp && (!best || lamp.t < best.t)) consider(lamp.t, lamp.n, [1,1,0.9], true);
+    const lamp = SCENE === 'cave' ? null : rayBox(cam.eye, dir, LAMP.min, LAMP.max); if (lamp && (!best || lamp.t < best.t)) consider(lamp.t, lamp.n, [1,1,0.9], true);
     const i = y*W + x;
     if (!best) { // sky
       depth[i] = 0; normal[i*4+3] = 0;
@@ -147,6 +168,8 @@ async function fetchText(u) { return (await fetch(u)).text(); }
 
 window.runTest = async function (opts) {
   const log = []; OPEN = !!opts.open;
+  SCENE = opts.scene || 'cornell'; TORCHES = opts.torches || [];
+  if (SCENE === 'cave') { WALL_COL = WALL_COL_CAVE; BOXES.splice(0, BOXES.length, ...CAVE_BOXES); OPEN = false; } else { WALL_COL = WALL_COL_CORNELL; }
   const adapter = await navigator.gpu.requestAdapter();
   const device = await adapter.requestDevice();
   const errors = [];
@@ -182,7 +205,7 @@ window.runTest = async function (opts) {
   const raw = gi(), accum = [gi(), gi()], metas = [meta(), meta()], tmpA = gi(), tmpB = gi(), final = gi();
   const view = t => t.createView();
 
-  const UB = 368;
+  const UB = 1424;
   function packUniforms(cam, prevCam, frame, step, histValid) {
     const buf = new ArrayBuffer(UB), f = new Float32Array(buf), ui = new Uint32Array(buf);
     f.set(cam.proj, 0); f.set(cam.invProj, 16); f.set(cam.worldFromView, 32); f.set(prevCam ? prevCam.projFromWorld : cam.projFromWorld, 48);
@@ -192,6 +215,15 @@ window.runTest = async function (opts) {
     f.set([opts.bleed, opts.historyFrames, opts.clampK, opts.denoise], 80);
     f.set([NEAR, histValid ? 1 : 0, step, 0], 84);
     ui.set([frame, opts.rays, opts.steps, opts.debug || 0], 88);
+    const dk = opts.dark || { scale: 1, gain: 1, shadow: 1, steps: 0, restore: 0.7 };
+    const lights = (opts.scene === 'cave' ? opts.lightList : []) || [];
+    f.set([dk.scale, dk.gain, dk.shadow, dk.steps], 92);
+    f.set([lights.length, dk.restore, 0, frame * 0.033], 96);
+    lights.forEach((l, k) => {
+      const vp = [0, 1, 2].map(r => cam.view[r] * l.pos[0] + cam.view[4 + r] * l.pos[1] + cam.view[8 + r] * l.pos[2] + cam.view[12 + r]);
+      f.set([vp[0], vp[1], vp[2], l.radius], 100 + 8 * k);
+      f.set([l.color[0], l.color[1], l.color[2], l.kind || 0], 104 + 8 * k);
+    });
     return buf;
   }
   const mkUB = (data) => { const b = device.createBuffer({ size: UB, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, data); return b; };
@@ -248,7 +280,7 @@ window.runTest = async function (opts) {
       }
       // debug views from the same GI buffers
       if (fi === frames - 1) {
-        for (const [name, dbg] of [['debug_indirect', 1], ['debug_ao', 2], ['debug_radiance', 4]]) {
+        for (const [name, dbg] of [['debug_indirect', 1], ['debug_ao', 2], ['debug_radiance', 4], ['debug_lights', 5], ['debug_scale', 6]]) {
           const e2 = device.createCommandEncoder();
           const ubd = ubDebug(dbg);
           const rp2 = e2.beginRenderPass({ colorAttachments: [{ view: view(target), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: 'store' }] });

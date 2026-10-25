@@ -177,7 +177,16 @@ fn trace(@builtin(global_invocation_id) gid: vec3u) {
         let hit = march(origin, dir, jitter);
         if hit.found {
             let c = color_at_uv(hit.uv);
-            var l = c * (1.0 + u.b.w * smoothstep(0.6, 1.0, luma(c)) * 2.0);
+            // What the hit surface looks like after darkness + lights (no shadow rays here).
+            let hd = depth_at_uv(hit.uv);
+            let hp = view_pos(hit.uv, hd);
+            var hn = normalize(normal_at_uv(hit.uv).xyz * 2.0 - 1.0);
+            if dot(hn, hp) > 0.0 {
+                hn = -hn;
+            }
+            let lfh = light_field(hp, hn, vec2u(0u), false);
+            var l = c * scene_scale(lfh.a) + c * (u.b.w * smoothstep(0.6, 1.0, luma(c)) * 2.0);
+            l += albedo_proxy(c) * lfh.rgb * u.l0.y;                // torch light bouncing on
             l += albedo_proxy(c) * prev_gi_at_uv(hit.uv) * u.a.w; // additional bounces
             l = min(l, vec3f(4.0));
             let fade = 1.0 - smoothstep(0.7, 1.0, hit.dist / u.a.x);

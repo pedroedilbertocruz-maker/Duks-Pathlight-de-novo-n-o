@@ -18,8 +18,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 
 add_mod(pathlight_gi
-        FEATURES webgpu
-        SOURCES src/mod.cpp
+        FEATURES game webgpu
+        SOURCES src/mod.cpp src/lights.cpp
         MOD_JSON mod.json
         RES_DIR res
 )

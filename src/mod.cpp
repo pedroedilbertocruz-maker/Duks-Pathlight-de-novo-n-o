@@ -22,8 +22,11 @@
 #include "mods/svc/resource.h"
 #include "mods/svc/ui.h"
 
+#include "lights.h"
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
@@ -64,6 +67,14 @@ ConfigVarHandle g_cvarEmissive = 0;
 ConfigVarHandle g_cvarDenoise = 0;
 ConfigVarHandle g_cvarHistory = 0;
 ConfigVarHandle g_cvarDebug = 0;
+// Dark lighting (Dark Souls 2 style)
+ConfigVarHandle g_cvarDarkMode = 0;
+ConfigVarHandle g_cvarDarkness = 0;
+ConfigVarHandle g_cvarLightGain = 0;
+ConfigVarHandle g_cvarLightRadius = 0;
+ConfigVarHandle g_cvarShadows = 0;
+ConfigVarHandle g_cvarFlicker = 0;
+ConfigVarHandle g_cvarSparks = 0;
 
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -134,8 +145,11 @@ struct GiUniforms {
     float c[4];  // color_bleed, max_history_frames, history_clamp_k, denoise_strength
     float d[4];  // near_plane, history_valid, denoise_step, unused
     uint32_t i[4];  // frame_index, rays_per_pixel, steps_per_ray, debug_view
+    float l0[4];    // ambient_scale, light_gain, shadow_strength, shadow_steps
+    float l1[4];    // light_count, restore, unused, time
+    float lights[64 * 4];  // view-space pos + radius, then rgb + kind, per light
 };
-static_assert(sizeof(GiUniforms) == 368, "GiUniforms must match res/common.wgsl");
+static_assert(sizeof(GiUniforms) == 368 + 32 + 1024, "GiUniforms must match res/common.wgsl");
 static_assert(sizeof(GiUniforms) % 16 == 0);
 
 struct ComputePayload {
@@ -554,6 +568,102 @@ void on_draw(
 // Game thread: stage hook
 // ---------------------------------------------------------------------------------------------
 
+// Per-frame dynamic-light state, built on the game thread right before the uniforms are filled.
+struct FrameLights {
+    float ambientScale = 1.0f;
+    float gain = 0.0f;
+    float shadowStrength = 0.0f;
+    float shadowSteps = 0.0f;
+    int count = 0;
+    float lights[64 * 4] = {};
+};
+FrameLights g_frameLights;
+float g_darkAmount = 0.0f;  // smoothed 0..1 "how dark is this place"
+bool g_darkInit = false;
+std::chrono::steady_clock::time_point g_darkTime;
+const std::chrono::steady_clock::time_point g_startTime = std::chrono::steady_clock::now();
+
+float smooth_flicker(const SceneLight& l, float t, float flickerOption) {
+    const float phase = l.pos[0] * 0.013f + l.pos[2] * 0.021f + l.pos[1] * 0.007f;
+    const float n = 0.5f * std::sin(t * 11.3f + phase) + 0.3f * std::sin(t * 17.9f + phase * 1.7f) +
+                    0.2f * std::sin(t * 29.3f + phase * 0.6f);
+    const float amount = (l.flicker * 0.45f + 0.03f) * flickerOption;
+    return 1.0f + n * amount;
+}
+
+void prepare_frame_lights(const CameraInfo& camera) {
+    FrameLights& f = g_frameLights;
+    f = FrameLights{};
+
+    const auto now = std::chrono::steady_clock::now();
+    float dt = 1.0f / 60.0f;
+    if (g_darkInit) {
+        dt = std::clamp(std::chrono::duration<float>(now - g_darkTime).count(), 0.0f, 0.25f);
+    }
+    g_darkTime = now;
+    const float t = std::chrono::duration<float>(now - g_startTime).count();
+
+    LightSnapshot snap;
+    collect_scene_lights(camera.eye, snap);
+
+    const int64_t mode = std::clamp<int64_t>(get_int_option(g_cvarDarkMode, 1), 0, 3);
+    const float slider = percent(g_cvarDarkness, 80, 0, 100);
+    float target = 0.0f;
+    switch (snap.stageClass) {
+    case STAGE_DUNGEON:
+        target = mode >= 1 ? slider : 0.0f;
+        break;
+    case STAGE_INTERIOR:
+        target = mode >= 2 ? slider : 0.0f;
+        break;
+    default:  // outdoors: only in "everywhere" mode, and mostly at night
+        target = mode >= 3 ? slider * (0.4f + 0.6f * snap.night) : 0.0f;
+        break;
+    }
+    if (!g_darkInit) {
+        g_darkAmount = target;  // no fade on the very first frame
+        g_darkInit = true;
+    } else {
+        const float step = dt / 1.2f;  // ~1.2 s fade between lit and dark places
+        g_darkAmount += std::clamp(target - g_darkAmount, -step, step);
+    }
+
+    f.ambientScale = 1.0f - 0.93f * g_darkAmount;
+    if (g_darkAmount < 0.01f) {
+        return;  // identical to plain GI: no extra lights
+    }
+
+    f.gain = percent(g_cvarLightGain, 100, 0, 400) * g_darkAmount;
+    const float shadow = percent(g_cvarShadows, 100, 0, 100);
+    static const float kSteps[4] = {6.0f, 10.0f, 14.0f, 20.0f};
+    f.shadowStrength = shadow;
+    f.shadowSteps = shadow > 0.0f
+                        ? kSteps[std::clamp<int64_t>(get_int_option(g_cvarQuality, 2), 0, 3)]
+                        : 0.0f;
+
+    const float radiusScale = percent(g_cvarLightRadius, 100, 30, 300);
+    const float flickerOption = percent(g_cvarFlicker, 100, 0, 200);
+    const bool sparks = get_bool_option(g_cvarSparks, true);
+    const float* m = camera.view_from_world;  // column-major
+    for (int i = 0; i < snap.count && f.count < 32; ++i) {
+        const SceneLight& l = snap.lights[i];
+        if (l.kind == LIGHT_KIND_SPARK && !sparks) {
+            continue;
+        }
+        const float flick = l.kind == LIGHT_KIND_SPARK ? 1.0f : smooth_flicker(l, t, flickerOption);
+        float* out = f.lights + f.count * 8;
+        for (int r = 0; r < 3; ++r) {
+            out[r] = m[r] * l.pos[0] + m[4 + r] * l.pos[1] + m[8 + r] * l.pos[2] + m[12 + r];
+        }
+        out[3] = l.radius * radiusScale * (1.0f + (flick - 1.0f) * 0.5f);
+        out[4] = l.color[0] * flick;
+        out[5] = l.color[1] * flick;
+        out[6] = l.color[2] * flick;
+        out[7] = static_cast<float>(l.kind);
+        ++f.count;
+    }
+}
+
 void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, uint32_t giHeight,
     uint32_t sceneWidth, uint32_t sceneHeight, bool historyValid, uint32_t debugView) {
     std::memcpy(u.proj, camera.proj_from_view, sizeof(u.proj));
@@ -596,6 +706,17 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
     u.i[1] = rays;
     u.i[2] = steps;
     u.i[3] = debugView;
+
+    const FrameLights& f = g_frameLights;
+    u.l0[0] = f.ambientScale;
+    u.l0[1] = f.gain;
+    u.l0[2] = f.shadowStrength;
+    u.l0[3] = f.shadowSteps;
+    u.l1[0] = static_cast<float>(f.count);
+    u.l1[1] = 0.7f;  // how much of the game's own lighting returns near a light
+    u.l1[2] = 0.0f;
+    u.l1[3] = 0.0f;
+    std::memcpy(u.lights, f.lights, sizeof(u.lights));
 }
 
 void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
@@ -659,7 +780,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     }
 
     const uint32_t debugView =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 4));
+        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 6));
+
+    prepare_frame_lights(camera);
 
     // One uniform block per dispatch group (trace/temporal, then three denoise strides).
     GiUniforms uniforms{};
@@ -760,7 +883,9 @@ ModResult build_controls_tab(
     static const char* kQuality[] = {"Low (1 ray)", "Medium (2 rays)", "High (2 rays, long)",
         "Ultra (4 rays)"};
     static const char* kDebug[] = {"Off", "Indirect light only", "Occlusion", "Normals",
-        "GI radiance"};
+        "GI radiance", "Dynamic light only", "Darkness scale"};
+    static const char* kDarkMode[] = {"Off (GI only)", "Dungeons and caves", "Dungeons, caves and interiors",
+        "Everywhere (extra dark at night)"};
 
     svc_ui->pane_add_section(mod_ctx, left, "Path-traced GI");
     add_toggle(left, "Enabled", g_cvarEnabled, "Turns the global illumination pass on or off.");
@@ -789,13 +914,30 @@ ModResult build_controls_tab(
     add_number(right, "Emissive Boost", g_cvarEmissive, 0, 300, 10, "%",
         "Extra bounce light from very bright pixels such as lamps, fire and magic.");
 
+    svc_ui->pane_add_section(mod_ctx, left, "Dark lighting (Dark Souls 2 style)");
+    add_select(left, "Where", g_cvarDarkMode, kDarkMode, 4,
+        "Where the world is darkened. Light then comes only from torches, candles, your lantern, "
+        "fire and sword sparks.");
+    add_number(left, "Darkness", g_cvarDarkness, 0, 100, 5, "%",
+        "How dark unlit areas are. 100 = almost pitch black.");
+    add_number(left, "Light Strength", g_cvarLightGain, 0, 400, 10, "%",
+        "Brightness of torches, lantern and sparks.");
+    add_number(left, "Light Radius", g_cvarLightRadius, 30, 300, 10, "%",
+        "How far each light reaches.");
+    add_number(left, "Light Shadows", g_cvarShadows, 0, 100, 10, "%",
+        "Objects block light and cast shadows (screen-space).");
+    add_number(left, "Flame Flicker", g_cvarFlicker, 0, 200, 10, "%",
+        "How much torch and lantern light flickers.");
+    add_toggle(left, "Sword Sparks", g_cvarSparks,
+        "A brief flash of light where your sword hits something.");
+
     svc_ui->pane_add_section(mod_ctx, right, "Denoiser");
     add_number(right, "Denoise Strength", g_cvarDenoise, 0, 100, 5, "%",
         "Spatial edge-aware filtering. Higher is smoother but softer.");
     add_number(right, "Temporal Frames", g_cvarHistory, 1, 96, 1, "",
         "How many frames of light are accumulated. Higher is smoother when still; lower reacts "
         "faster to moving lights and objects.");
-    add_select(right, "Debug View", g_cvarDebug, kDebug, 5,
+    add_select(right, "Debug View", g_cvarDebug, kDebug, 7,
         "Visualize individual parts of the effect.");
     return MOD_OK;
 }
@@ -901,6 +1043,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_int_option("denoise", 50, g_cvarDenoise, error);
     if (result == MOD_OK) result = register_int_option("temporalFrames", 24, g_cvarHistory, error);
     if (result == MOD_OK) result = register_int_option("debugView", 0, g_cvarDebug, error);
+    if (result == MOD_OK) result = register_int_option("darkMode", 1, g_cvarDarkMode, error);
+    if (result == MOD_OK) result = register_int_option("darkness", 80, g_cvarDarkness, error);
+    if (result == MOD_OK) result = register_int_option("lightStrength", 100, g_cvarLightGain, error);
+    if (result == MOD_OK) result = register_int_option("lightRadius", 100, g_cvarLightRadius, error);
+    if (result == MOD_OK) result = register_int_option("lightShadows", 100, g_cvarShadows, error);
+    if (result == MOD_OK) result = register_int_option("flameFlicker", 100, g_cvarFlicker, error);
+    if (result == MOD_OK) result = register_bool_option("swordSparks", true, g_cvarSparks, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -991,6 +1140,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarEnabled = g_cvarQuality = g_cvarHalfRes = g_cvarIntensity = g_cvarBounces = 0;
     g_cvarDistance = g_cvarAo = g_cvarBleed = g_cvarSky = g_cvarEmissive = 0;
     g_cvarDenoise = g_cvarHistory = g_cvarDebug = 0;
+    g_cvarDarkMode = g_cvarDarkness = g_cvarLightGain = g_cvarLightRadius = 0;
+    g_cvarShadows = g_cvarFlicker = g_cvarSparks = 0;
+    g_darkInit = false;
+    g_darkAmount = 0.0f;
     g_computeType = g_drawType = 0;
     g_afterOpaqueHook = 0;
     g_controlsWindow = 0;

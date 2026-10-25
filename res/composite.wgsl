@@ -5,7 +5,8 @@
 //   src.a   = contact occlusion           (darkens crevices)
 // GI is upsampled with depth-aware bilinear weights so half-resolution GI keeps clean edges.
 //
-// Debug views (debug_view): 1 indirect light only, 2 occlusion, 3 normals, 4 raw GI radiance.
+// Debug views (debug_view): 1 indirect light only, 2 occlusion, 3 normals, 4 raw GI radiance,
+// 5 dynamic light only, 6 darkness scale.
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var depth_tex: texture_2d<f32>;
@@ -65,16 +66,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     }
     let color = textureLoad(color_tex, tex_px(textureDimensions(color_tex), in.uv), 0).rgb;
     let gi = upsample_gi(in.uv, view_w(in.uv, depth));
-    // "Screen"-style energy-conserving add: shadows and dark areas gain the most, surfaces that are
-    // already bright are not blown out.
-    let indirect = albedo_proxy(color) * gi.rgb * u.a.z * (vec3f(1.0) - color);
+
+    // Darkness + dynamic lights. With no darkening and no lights this is the identity.
+    let p = view_pos(in.uv, depth);
+    var n = normalize(nrm.xyz * 2.0 - 1.0);
+    if dot(n, p) > 0.0 {
+        n = -n;
+    }
+    let lf = light_field(p, n, vec2u(in.position.xy), true);
+    let scale = scene_scale(lf.a);
+    let albedo = albedo_proxy(color);
+    let base = color * scale;
+    // Light reaching the surface is tinted by its albedo; "screen"-style so it never blows out.
+    let direct = albedo * lf.rgb * u.l0.y * (vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95)));
+    // Same energy-conserving add for the bounced light, relative to the darkened surface.
+    let indirect = albedo * gi.rgb * u.a.z * (vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95)));
     let occlusion = clamp(gi.a * u.b.y, 0.0, 0.95);
 
     switch u.i.w {
         case 1u: { return vec4f(indirect, 1.0); }
         case 2u: { return vec4f(vec3f(1.0 - occlusion), 1.0); }
         case 4u: { return vec4f(gi.rgb, 1.0); }
+        case 5u: { return vec4f(direct, 1.0); }
+        case 6u: { return vec4f(vec3f(scale), 1.0); }
         default: {}
     }
-    return vec4f(indirect, occlusion);
+    // premultiplied: out = rgb + dst * (1 - a)  =>  dst * scale * (1 - occlusion) + light
+    return vec4f(indirect + direct, 1.0 - scale * (1.0 - occlusion));
 }

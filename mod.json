@@ -1,7 +1,7 @@
 {
   "id": "dev.community.pathlight_gi",
   "name": "PathLight GI",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Community",
-  "description": "Real-time path-traced-style global illumination: Monte Carlo ray tracing in screen space with multi-bounce light, color bleeding, sky light, contact shadows, temporal accumulation and an edge-aware denoiser."
+  "description": "Path-traced-style global illumination plus Dark Souls 2 style dark lighting: dungeons and caves become truly dark and are lit only by torches, candles, your lantern, fire and sword sparks, with soft shadows, flicker, color bleeding and multi-bounce light."
 }
