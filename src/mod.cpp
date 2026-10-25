@@ -1,0 +1,1002 @@
+// PathLight GI - real-time path-traced-style global illumination for Dusklight.
+//
+// This mod approximates what a hardware path tracer produces (colour bleeding, soft indirect
+// light, sky light, contact shadowing, multi-bounce light) using only the data the Dusklight
+// GfxService exposes after the opaque pass: scene colour, depth and view-space normals.
+//
+// Per frame (all on the GPU, after opaque scene draws and before translucent lists):
+//   1. trace    - Monte Carlo cosine-weighted rays marched through the depth buffer; hits return the
+//                 lit colour of what they hit plus that surface's previous-frame indirect light
+//                 (infinite bounces through temporal feedback).
+//   2. temporal - reprojected history accumulation with neighbourhood clamping.
+//   3. denoise  - 3x edge-aware a-trous wavelet filter (depth / normal / luminance).
+//   4. composite- depth-aware upsample and energy-conserving blend over the scene.
+//
+// The WGSL lives in res/ and is also exercised by tools/harness against a synthetic scene.
+
+#include "mods/service.hpp"
+#include "mods/svc/camera.h"
+#include "mods/svc/config.h"
+#include "mods/svc/gfx.h"
+#include "mods/svc/log.h"
+#include "mods/svc/resource.h"
+#include "mods/svc/ui.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <initializer_list>
+#include <string>
+#include <type_traits>
+#include <vector>
+#include <webgpu/webgpu.h>
+
+DEFINE_MOD();
+IMPORT_SERVICE(LogService, svc_log);
+IMPORT_SERVICE(ConfigService, svc_config);
+IMPORT_SERVICE(ResourceService, svc_resource);
+IMPORT_SERVICE(UiService, svc_ui);
+IMPORT_SERVICE(GfxService, svc_gfx);
+IMPORT_SERVICE(CameraService, svc_camera);
+
+namespace {
+
+// ---------------------------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------------------------
+
+struct Option {
+    const char* name;
+    ConfigVarHandle handle;
+};
+
+ConfigVarHandle g_cvarEnabled = 0;
+ConfigVarHandle g_cvarQuality = 0;
+ConfigVarHandle g_cvarHalfRes = 0;
+ConfigVarHandle g_cvarIntensity = 0;
+ConfigVarHandle g_cvarBounces = 0;
+ConfigVarHandle g_cvarDistance = 0;
+ConfigVarHandle g_cvarAo = 0;
+ConfigVarHandle g_cvarBleed = 0;
+ConfigVarHandle g_cvarSky = 0;
+ConfigVarHandle g_cvarEmissive = 0;
+ConfigVarHandle g_cvarDenoise = 0;
+ConfigVarHandle g_cvarHistory = 0;
+ConfigVarHandle g_cvarDebug = 0;
+
+GfxComputeTypeHandle g_computeType = 0;
+GfxDrawTypeHandle g_drawType = 0;
+GfxStageHookHandle g_afterOpaqueHook = 0;
+UiWindowHandle g_controlsWindow = 0;
+
+ResourceBuffer g_commonSource = RESOURCE_BUFFER_INIT;
+ResourceBuffer g_traceSource = RESOURCE_BUFFER_INIT;
+ResourceBuffer g_temporalSource = RESOURCE_BUFFER_INIT;
+ResourceBuffer g_denoiseSource = RESOURCE_BUFFER_INIT;
+ResourceBuffer g_compositeSource = RESOURCE_BUFFER_INIT;
+
+GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+GfxRenderTargetLayout g_sceneTargetLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
+
+WGPUComputePipeline g_tracePipeline = nullptr;
+WGPUComputePipeline g_temporalPipeline = nullptr;
+WGPUComputePipeline g_denoisePipeline = nullptr;
+WGPUBindGroupLayout g_traceLayout = nullptr;
+WGPUBindGroupLayout g_temporalLayout = nullptr;
+WGPUBindGroupLayout g_denoiseLayout = nullptr;
+WGPURenderPipeline g_compositePipeline = nullptr;
+WGPURenderPipeline g_compositeDebugPipeline = nullptr;
+WGPUBindGroupLayout g_compositeLayout = nullptr;
+WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
+
+// ---------------------------------------------------------------------------------------------
+// GI render targets (resolution of the GI buffers, possibly half the scene resolution)
+// ---------------------------------------------------------------------------------------------
+
+struct GiTargets {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WGPUTexture textures[10] = {};
+    WGPUTextureView views[10] = {};
+    // Indices into textures/views.
+    enum : int { Raw, AccumA, AccumB, MetaA, MetaB, TmpA, TmpB, Final, Count };
+};
+
+// The render worker reads a GiTargets by pointer from the payload. Replaced targets are kept alive
+// for a few frames so in-flight payloads never see freed GPU objects.
+GiTargets* g_targets = nullptr;
+struct Retired {
+    GiTargets* targets;
+    int framesLeft;
+};
+std::vector<Retired> g_retired;
+
+uint32_t g_pingPong = 0;
+bool g_havePrevCamera = false;
+float g_prevProjFromWorld[16] = {};
+float g_prevEye[3] = {};
+uint32_t g_frameIndex = 0;
+bool g_warnedNoDepth = false;
+std::atomic<bool> g_chainExecuted{false};
+bool g_loggedChain = false;
+
+// Mirror of the WGSL `Uniforms` struct (res/common.wgsl). Keep in sync.
+struct GiUniforms {
+    float proj[16];
+    float inv_proj[16];
+    float world_from_view[16];
+    float prev_proj_from_world[16];
+    float dims[4];
+    float full[4];
+    float a[4];  // ray_length, thickness, intensity, bounce_gain
+    float b[4];  // ao_radius, ao_strength, sky_gain, emissive_boost
+    float c[4];  // color_bleed, max_history_frames, history_clamp_k, denoise_strength
+    float d[4];  // near_plane, history_valid, denoise_step, unused
+    uint32_t i[4];  // frame_index, rays_per_pixel, steps_per_ray, debug_view
+};
+static_assert(sizeof(GiUniforms) == 368, "GiUniforms must match res/common.wgsl");
+static_assert(sizeof(GiUniforms) % 16 == 0);
+
+struct ComputePayload {
+    const GiTargets* targets;
+    WGPUTextureView depth;
+    WGPUTextureView normal;
+    WGPUTextureView color;
+    uint32_t uniformOffset[4];  // trace/temporal, denoise step 1, 2, 4
+    uint32_t uniformSize;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pingPong;
+};
+static_assert(sizeof(ComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<ComputePayload>);
+
+struct CompositePayload {
+    const GiTargets* targets;
+    WGPUTextureView depth;
+    WGPUTextureView normal;
+    WGPUTextureView color;
+    uint32_t uniformOffset;
+    uint32_t uniformSize;
+    uint32_t debugView;
+    uint32_t pad;
+};
+static_assert(sizeof(CompositePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<CompositePayload>);
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
+    int64_t value = fallback;
+    if (handle == 0 || svc_config->get_int(mod_ctx, handle, &value) != MOD_OK) {
+        return fallback;
+    }
+    return value;
+}
+
+bool get_bool_option(ConfigVarHandle handle, bool fallback) {
+    bool value = fallback;
+    if (handle == 0 || svc_config->get_bool(mod_ctx, handle, &value) != MOD_OK) {
+        return fallback;
+    }
+    return value;
+}
+
+float percent(ConfigVarHandle handle, int64_t fallback, int64_t lo, int64_t hi) {
+    return static_cast<float>(std::clamp<int64_t>(get_int_option(handle, fallback), lo, hi)) /
+           100.0f;
+}
+
+void quality_counts(int64_t quality, uint32_t& rays, uint32_t& steps) {
+    switch (std::clamp<int64_t>(quality, 0, 3)) {
+    case 0:
+        rays = 1;
+        steps = 12;
+        break;
+    case 1:
+        rays = 2;
+        steps = 16;
+        break;
+    default:
+    case 2:
+        rays = 2;
+        steps = 24;
+        break;
+    case 3:
+        rays = 4;
+        steps = 32;
+        break;
+    }
+}
+
+WGPUShaderModule create_shader_module(const char* label, const ResourceBuffer& pass) {
+    // Every pass is prefixed with res/common.wgsl.
+    std::string code(static_cast<const char*>(g_commonSource.data), g_commonSource.size);
+    code += '\n';
+    code.append(static_cast<const char*>(pass.data), pass.size);
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = {code.data(), code.size()};
+    WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    moduleDesc.nextInChain = &wgsl.chain;
+    moduleDesc.label = {label, WGPU_STRLEN};
+    return wgpuDeviceCreateShaderModule(g_deviceInfo.device, &moduleDesc);
+}
+
+bool build_compute_pipeline(const char* label, const ResourceBuffer& source, const char* entry,
+    WGPUComputePipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
+    WGPUShaderModule module = create_shader_module(label, source);
+    if (module == nullptr) {
+        return false;
+    }
+    WGPUComputePipelineDescriptor pipelineDesc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    pipelineDesc.label = {label, WGPU_STRLEN};
+    pipelineDesc.compute.module = module;
+    pipelineDesc.compute.entryPoint = {entry, WGPU_STRLEN};
+    outPipeline = wgpuDeviceCreateComputePipeline(g_deviceInfo.device, &pipelineDesc);
+    wgpuShaderModuleRelease(module);
+    if (outPipeline == nullptr) {
+        return false;
+    }
+    outLayout = wgpuComputePipelineGetBindGroupLayout(outPipeline, 0);
+    return outLayout != nullptr;
+}
+
+bool build_composite_pipeline(const GfxRenderTargetLayout& targetLayout, bool blend,
+    WGPURenderPipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
+    WGPUShaderModule module = create_shader_module("PathLight composite", g_compositeSource);
+    if (module == nullptr) {
+        return false;
+    }
+
+    // Premultiplied blend: out = src.rgb + dst * (1 - src.a); destination alpha is preserved.
+    WGPUBlendState blendState{
+        .color =
+            {
+                .operation = WGPUBlendOperation_Add,
+                .srcFactor = WGPUBlendFactor_One,
+                .dstFactor = WGPUBlendFactor_OneMinusSrcAlpha,
+            },
+        .alpha =
+            {
+                .operation = WGPUBlendOperation_Add,
+                .srcFactor = WGPUBlendFactor_Zero,
+                .dstFactor = WGPUBlendFactor_One,
+            },
+    };
+    WGPUColorTargetState colorTargets[GFX_MAX_COLOR_ATTACHMENTS];
+    const uint32_t colorTargetCount = gfx_init_color_target_states(
+        &targetLayout, colorTargets, blend ? &blendState : nullptr, WGPUColorWriteMask_All);
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = {"fs_main", WGPU_STRLEN};
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
+    // Depth state must match the scene pass even though it is never touched.
+    WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depthStencil.format = targetLayout.depth_stencil_format;
+    depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
+    depthStencil.depthCompare = WGPUCompareFunction_Always;
+
+    WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pipelineDesc.label = {blend ? "PathLight composite" : "PathLight composite (debug)",
+        WGPU_STRLEN};
+    pipelineDesc.vertex.module = module;
+    pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
+    pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pipelineDesc.depthStencil = &depthStencil;
+    pipelineDesc.multisample.count = targetLayout.sample_count;
+    pipelineDesc.fragment = &fragment;
+    outPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
+    wgpuShaderModuleRelease(module);
+    if (outPipeline == nullptr) {
+        return false;
+    }
+    outLayout = wgpuRenderPipelineGetBindGroupLayout(outPipeline, 0);
+    return outLayout != nullptr;
+}
+
+void release_composite() {
+    for (auto* pipeline : {&g_compositePipeline, &g_compositeDebugPipeline}) {
+        if (*pipeline != nullptr) {
+            wgpuRenderPipelineRelease(*pipeline);
+            *pipeline = nullptr;
+        }
+    }
+    for (auto* layout : {&g_compositeLayout, &g_compositeDebugLayout}) {
+        if (*layout != nullptr) {
+            wgpuBindGroupLayoutRelease(*layout);
+            *layout = nullptr;
+        }
+    }
+    g_sceneTargetLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
+}
+
+bool ensure_composite(const GfxRenderTargetLayout& layout) {
+    if (g_compositePipeline != nullptr && g_compositeDebugPipeline != nullptr &&
+        g_sceneTargetLayout.key == layout.key)
+    {
+        return true;
+    }
+    release_composite();
+    if (!build_composite_pipeline(layout, true, g_compositePipeline, g_compositeLayout) ||
+        !build_composite_pipeline(layout, false, g_compositeDebugPipeline, g_compositeDebugLayout))
+    {
+        release_composite();
+        return false;
+    }
+    g_sceneTargetLayout = layout;
+    return true;
+}
+
+void destroy_targets(GiTargets* targets) {
+    if (targets == nullptr) {
+        return;
+    }
+    for (int i = 0; i < GiTargets::Count; ++i) {
+        if (targets->views[i] != nullptr) {
+            wgpuTextureViewRelease(targets->views[i]);
+        }
+        if (targets->textures[i] != nullptr) {
+            wgpuTextureRelease(targets->textures[i]);
+        }
+    }
+    delete targets;
+}
+
+void retire_targets() {
+    if (g_targets != nullptr) {
+        g_retired.push_back({g_targets, 4});
+        g_targets = nullptr;
+    }
+    g_havePrevCamera = false;
+}
+
+void tick_retired() {
+    for (auto it = g_retired.begin(); it != g_retired.end();) {
+        if (--it->framesLeft <= 0) {
+            destroy_targets(it->targets);
+            it = g_retired.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool ensure_targets(uint32_t width, uint32_t height) {
+    if (g_targets != nullptr && g_targets->width == width && g_targets->height == height) {
+        return true;
+    }
+    retire_targets();
+
+    auto* targets = new GiTargets();
+    targets->width = width;
+    targets->height = height;
+    const WGPUTextureUsage usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
+    bool ok = true;
+    for (int i = 0; i < GiTargets::Count && ok; ++i) {
+        const bool isMeta = i == GiTargets::MetaA || i == GiTargets::MetaB;
+        WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        texDesc.label = {"PathLight GI", WGPU_STRLEN};
+        texDesc.usage = usage;
+        texDesc.size = {width, height, 1};
+        texDesc.format = isMeta ? WGPUTextureFormat_RG32Float : WGPUTextureFormat_RGBA16Float;
+        targets->textures[i] = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
+        ok = targets->textures[i] != nullptr;
+        if (ok) {
+            targets->views[i] = wgpuTextureCreateView(targets->textures[i], nullptr);
+            ok = targets->views[i] != nullptr;
+        }
+    }
+    if (!ok) {
+        destroy_targets(targets);
+        return false;
+    }
+    g_targets = targets;
+    return true;
+}
+
+constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
+    return (numerator + denominator - 1) / denominator;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render worker thread callbacks
+// ---------------------------------------------------------------------------------------------
+
+void on_compute(
+    ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(ComputePayload) || g_tracePipeline == nullptr) {
+        return;
+    }
+    ComputePayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.targets == nullptr || data.depth == nullptr || data.normal == nullptr ||
+        data.color == nullptr)
+    {
+        return;
+    }
+    const GiTargets& t = *data.targets;
+    const uint32_t cur = data.pingPong & 1u;
+    const uint32_t prev = cur ^ 1u;
+    const WGPUTextureView accumPrev = t.views[prev == 0 ? GiTargets::AccumA : GiTargets::AccumB];
+    const WGPUTextureView accumCur = t.views[cur == 0 ? GiTargets::AccumA : GiTargets::AccumB];
+    const WGPUTextureView metaPrev = t.views[prev == 0 ? GiTargets::MetaA : GiTargets::MetaB];
+    const WGPUTextureView metaCur = t.views[cur == 0 ? GiTargets::MetaA : GiTargets::MetaB];
+
+    struct Entry {
+        uint32_t binding;
+        WGPUTextureView view;       // texture entry if non-null
+        uint32_t uniformOffset;     // otherwise uniform entry
+    };
+    const auto makeBindGroup = [&](WGPUBindGroupLayout layout, std::initializer_list<Entry> list) {
+        WGPUBindGroupEntry entries[12];
+        size_t count = 0;
+        for (const Entry& e : list) {
+            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+            entry.binding = e.binding;
+            if (e.view != nullptr) {
+                entry.textureView = e.view;
+            } else {
+                entry.buffer = ctx->uniform_buffer;
+                entry.offset = e.uniformOffset;
+                entry.size = data.uniformSize;
+            }
+            entries[count++] = entry;
+        }
+        WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        desc.layout = layout;
+        desc.entryCount = count;
+        desc.entries = entries;
+        return wgpuDeviceCreateBindGroup(ctx->device, &desc);
+    };
+    const auto tex = [](uint32_t binding, WGPUTextureView view) { return Entry{binding, view, 0}; };
+    const auto ubo = [](uint32_t offset) { return Entry{0, nullptr, offset}; };
+
+    WGPUBindGroup groups[5] = {};
+    groups[0] = makeBindGroup(g_traceLayout,
+        {ubo(data.uniformOffset[0]), tex(1, data.depth), tex(2, data.normal), tex(3, data.color),
+            tex(4, t.views[GiTargets::Final]), tex(5, t.views[GiTargets::Raw])});
+    groups[1] = makeBindGroup(g_temporalLayout,
+        {ubo(data.uniformOffset[0]), tex(1, data.depth), tex(2, data.normal),
+            tex(4, t.views[GiTargets::Raw]), tex(5, accumPrev), tex(6, metaPrev),
+            tex(7, accumCur), tex(8, metaCur)});
+    groups[2] = makeBindGroup(g_denoiseLayout,
+        {ubo(data.uniformOffset[1]), tex(1, data.depth), tex(2, data.normal), tex(4, accumCur),
+            tex(6, metaCur), tex(7, t.views[GiTargets::TmpA])});
+    groups[3] = makeBindGroup(g_denoiseLayout,
+        {ubo(data.uniformOffset[2]), tex(1, data.depth), tex(2, data.normal),
+            tex(4, t.views[GiTargets::TmpA]), tex(6, metaCur), tex(7, t.views[GiTargets::TmpB])});
+    groups[4] = makeBindGroup(g_denoiseLayout,
+        {ubo(data.uniformOffset[3]), tex(1, data.depth), tex(2, data.normal),
+            tex(4, t.views[GiTargets::TmpB]), tex(6, metaCur), tex(7, t.views[GiTargets::Final])});
+
+    bool valid = true;
+    for (WGPUBindGroup group : groups) {
+        valid = valid && group != nullptr;
+    }
+    if (valid) {
+        WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+        passDesc.label = {"PathLight GI", WGPU_STRLEN};
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
+        const uint32_t gx = div_ceil(data.width, 8);
+        const uint32_t gy = div_ceil(data.height, 8);
+        const auto dispatch = [&](WGPUComputePipeline pipeline, WGPUBindGroup group) {
+            wgpuComputePassEncoderSetPipeline(pass, pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);
+        };
+        dispatch(g_tracePipeline, groups[0]);
+        dispatch(g_temporalPipeline, groups[1]);
+        dispatch(g_denoisePipeline, groups[2]);
+        dispatch(g_denoisePipeline, groups[3]);
+        dispatch(g_denoisePipeline, groups[4]);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        g_chainExecuted.store(true, std::memory_order_release);
+    }
+    for (WGPUBindGroup group : groups) {
+        if (group != nullptr) {
+            wgpuBindGroupRelease(group);
+        }
+    }
+}
+
+void on_draw(
+    ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(CompositePayload) || !ensure_composite(ctx->layout)) {
+        return;
+    }
+    CompositePayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    const bool debug = data.debugView != 0;
+    WGPURenderPipeline pipeline = debug ? g_compositeDebugPipeline : g_compositePipeline;
+    WGPUBindGroupLayout layout = debug ? g_compositeDebugLayout : g_compositeLayout;
+    if (data.targets == nullptr || data.depth == nullptr || data.normal == nullptr ||
+        data.color == nullptr || pipeline == nullptr)
+    {
+        return;
+    }
+
+    WGPUBindGroupEntry entries[5];
+    for (auto& entry : entries) {
+        entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    }
+    entries[0].binding = 0;
+    entries[0].buffer = ctx->uniform_buffer;
+    entries[0].offset = data.uniformOffset;
+    entries[0].size = data.uniformSize;
+    entries[1].binding = 1;
+    entries[1].textureView = data.depth;
+    entries[2].binding = 2;
+    entries[2].textureView = data.normal;
+    entries[3].binding = 3;
+    entries[3].textureView = data.color;
+    entries[4].binding = 4;
+    entries[4].textureView = data.targets->views[GiTargets::Final];
+    WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    desc.layout = layout;
+    desc.entryCount = 5;
+    desc.entries = entries;
+    WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &desc);
+    if (bindGroup == nullptr) {
+        return;
+    }
+    wgpuRenderPassEncoderSetPipeline(ctx->pass, pipeline);
+    wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, bindGroup, 0, nullptr);
+    wgpuRenderPassEncoderDraw(ctx->pass, 3, 1, 0, 0);
+    wgpuBindGroupRelease(bindGroup);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Game thread: stage hook
+// ---------------------------------------------------------------------------------------------
+
+void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, uint32_t giHeight,
+    uint32_t sceneWidth, uint32_t sceneHeight, bool historyValid, uint32_t debugView) {
+    std::memcpy(u.proj, camera.proj_from_view, sizeof(u.proj));
+    std::memcpy(u.inv_proj, camera.view_from_proj, sizeof(u.inv_proj));
+    std::memcpy(u.world_from_view, camera.world_from_view, sizeof(u.world_from_view));
+    std::memcpy(u.prev_proj_from_world, historyValid ? g_prevProjFromWorld : camera.proj_from_world,
+        sizeof(u.prev_proj_from_world));
+
+    u.dims[0] = static_cast<float>(giWidth);
+    u.dims[1] = static_cast<float>(giHeight);
+    u.dims[2] = 1.0f / u.dims[0];
+    u.dims[3] = 1.0f / u.dims[1];
+    u.full[0] = static_cast<float>(sceneWidth);
+    u.full[1] = static_cast<float>(sceneHeight);
+    u.full[2] = u.full[0] / u.dims[0];
+    u.full[3] = u.full[1] / u.dims[1];
+
+    const float distance =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDistance, 600), 50, 3000));
+    u.a[0] = distance;
+    u.a[1] = std::clamp(distance * 0.08f, 8.0f, 150.0f);  // surface thickness
+    u.a[2] = percent(g_cvarIntensity, 110, 0, 400);
+    u.a[3] = percent(g_cvarBounces, 60, 0, 90);
+    u.b[0] = std::max(distance * 0.2f, 10.0f);  // contact-occlusion radius
+    u.b[1] = percent(g_cvarAo, 60, 0, 100);
+    u.b[2] = percent(g_cvarSky, 50, 0, 300);
+    u.b[3] = percent(g_cvarEmissive, 50, 0, 300);
+    u.c[0] = percent(g_cvarBleed, 100, 0, 100);
+    u.c[1] = static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarHistory, 24), 1, 96));
+    u.c[2] = 3.0f;
+    u.c[3] = percent(g_cvarDenoise, 50, 0, 100);
+    u.d[0] = std::max(camera.near_plane, 0.01f);
+    u.d[1] = historyValid ? 1.0f : 0.0f;
+    u.d[2] = 1.0f;
+    u.d[3] = 0.0f;
+
+    uint32_t rays = 2, steps = 24;
+    quality_counts(get_int_option(g_cvarQuality, 2), rays, steps);
+    u.i[0] = g_frameIndex;
+    u.i[1] = rays;
+    u.i[2] = steps;
+    u.i[3] = debugView;
+}
+
+void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
+    tick_retired();
+    if (!get_bool_option(g_cvarEnabled, true)) {
+        if (g_targets != nullptr) {
+            retire_targets();  // drop stale history while disabled
+        }
+        return;
+    }
+    if (stageCtx == nullptr || stageCtx->struct_size < sizeof(GfxStageContext) ||
+        stageCtx->game_view == nullptr)
+    {
+        return;
+    }
+
+    CameraInfo camera = CAMERA_INFO_INIT;
+    if (svc_camera->get_camera(mod_ctx, stageCtx->game_view, &camera) != MOD_OK) {
+        return;
+    }
+
+    GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+    resolveDesc.color = true;
+    resolveDesc.depth = true;
+    resolveDesc.normal = true;
+    GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+    if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
+        resolved.depth == nullptr || resolved.color == nullptr)
+    {
+        if (!g_warnedNoDepth) {
+            g_warnedNoDepth = true;
+            svc_log->warn(mod_ctx, "scene colour/depth snapshots unavailable; PathLight GI idle");
+        }
+        return;
+    }
+    // The first request enables normals from the next frame on.
+    if (resolved.normal == nullptr) {
+        return;
+    }
+
+    const uint32_t divisor = get_bool_option(g_cvarHalfRes, true) ? 2 : 1;
+    const uint32_t width = resolved.width / divisor;
+    const uint32_t height = resolved.height / divisor;
+    if (width < 32 || height < 32) {
+        return;
+    }
+    const bool hadTargets = g_targets != nullptr;
+    if (!ensure_targets(width, height)) {
+        return;
+    }
+
+    // History is only valid for a continuous camera on unchanged targets.
+    bool historyValid = hadTargets && g_havePrevCamera && g_targets != nullptr;
+    if (historyValid) {
+        const float dx = camera.eye[0] - g_prevEye[0];
+        const float dy = camera.eye[1] - g_prevEye[1];
+        const float dz = camera.eye[2] - g_prevEye[2];
+        if (std::sqrt(dx * dx + dy * dy + dz * dz) > 1500.0f) {
+            historyValid = false;  // teleport / scene cut
+        }
+    }
+
+    const uint32_t debugView =
+        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 4));
+
+    // One uniform block per dispatch group (trace/temporal, then three denoise strides).
+    GiUniforms uniforms{};
+    fill_uniforms(uniforms, camera, width, height, resolved.width, resolved.height, historyValid,
+        debugView);
+    GfxRange ranges[4] = {};
+    const float strides[4] = {1.0f, 1.0f, 2.0f, 4.0f};
+    for (int i = 0; i < 4; ++i) {
+        uniforms.d[2] = strides[i];
+        if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &ranges[i]) != MOD_OK) {
+            return;
+        }
+    }
+
+    ComputePayload computePayload{};
+    computePayload.targets = g_targets;
+    computePayload.depth = resolved.depth;
+    computePayload.normal = resolved.normal;
+    computePayload.color = resolved.color;
+    for (int i = 0; i < 4; ++i) {
+        computePayload.uniformOffset[i] = ranges[i].offset;
+    }
+    computePayload.uniformSize = ranges[0].size;
+    computePayload.width = width;
+    computePayload.height = height;
+    computePayload.pingPong = g_pingPong;
+    if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
+        MOD_OK)
+    {
+        return;
+    }
+
+    CompositePayload drawPayload{};
+    drawPayload.targets = g_targets;
+    drawPayload.depth = resolved.depth;
+    drawPayload.normal = resolved.normal;
+    drawPayload.color = resolved.color;
+    drawPayload.uniformOffset = ranges[0].offset;
+    drawPayload.uniformSize = ranges[0].size;
+    drawPayload.debugView = debugView;
+    svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
+
+    std::memcpy(g_prevProjFromWorld, camera.proj_from_world, sizeof(g_prevProjFromWorld));
+    std::memcpy(g_prevEye, camera.eye, sizeof(g_prevEye));
+    g_havePrevCamera = true;
+    g_pingPong ^= 1u;
+    g_frameIndex = (g_frameIndex + 1u) & 4095u;
+}
+
+// ---------------------------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------------------------
+
+void add_control(UiElementHandle pane, const UiControlDesc& desc) {
+    svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
+}
+
+void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle cvar, const char* help) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = label;
+    control.help_rml = help;
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = cvar;
+    add_control(pane, control);
+}
+
+void add_number(UiElementHandle pane, const char* label, ConfigVarHandle cvar, int min, int max,
+    int step, const char* suffix, const char* help) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_NUMBER;
+    control.label = label;
+    control.help_rml = help;
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = cvar;
+    control.min = min;
+    control.max = max;
+    control.step = step;
+    control.suffix = suffix;
+    add_control(pane, control);
+}
+
+void add_select(UiElementHandle pane, const char* label, ConfigVarHandle cvar,
+    const char* const* options, int count, const char* help) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = label;
+    control.help_rml = help;
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = cvar;
+    control.options = options;
+    control.option_count = count;
+    add_control(pane, control);
+}
+
+ModResult build_controls_tab(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    static const char* kQuality[] = {"Low (1 ray)", "Medium (2 rays)", "High (2 rays, long)",
+        "Ultra (4 rays)"};
+    static const char* kDebug[] = {"Off", "Indirect light only", "Occlusion", "Normals",
+        "GI radiance"};
+
+    svc_ui->pane_add_section(mod_ctx, left, "Path-traced GI");
+    add_toggle(left, "Enabled", g_cvarEnabled, "Turns the global illumination pass on or off.");
+    add_select(left, "Quality", g_cvarQuality, kQuality, 4,
+        "Rays per pixel per frame and march steps per ray. Light accumulates over time, so even "
+        "Low converges to a smooth result when the camera is still.");
+    add_toggle(left, "Half Resolution", g_cvarHalfRes,
+        "Traces at half resolution and upsamples with depth-aware filtering. Recommended; "
+        "roughly 3-4x faster.");
+    add_number(left, "Intensity", g_cvarIntensity, 0, 400, 5, "%",
+        "Strength of the indirect light added to the scene.");
+    add_number(left, "Bounces", g_cvarBounces, 0, 90, 5, "%",
+        "How much light is carried over from surface to surface across frames (multi-bounce). "
+        "0 = single bounce.");
+    add_number(left, "Ray Distance", g_cvarDistance, 50, 3000, 50, "",
+        "How far (in game units) a light ray may travel. Larger = more distant color bleeding "
+        "but a bit more noise.");
+
+    svc_ui->pane_add_section(mod_ctx, right, "Look");
+    add_number(right, "Contact Shadows", g_cvarAo, 0, 100, 5, "%",
+        "Darkening of creases and contact areas from nearby geometry.");
+    add_number(right, "Color Bleeding", g_cvarBleed, 0, 100, 5, "%",
+        "0 = bounce light is neutral, 100 = tinted by the color of nearby surfaces.");
+    add_number(right, "Sky Light", g_cvarSky, 0, 300, 10, "%",
+        "How much visible sky lights the scene.");
+    add_number(right, "Emissive Boost", g_cvarEmissive, 0, 300, 10, "%",
+        "Extra bounce light from very bright pixels such as lamps, fire and magic.");
+
+    svc_ui->pane_add_section(mod_ctx, right, "Denoiser");
+    add_number(right, "Denoise Strength", g_cvarDenoise, 0, 100, 5, "%",
+        "Spatial edge-aware filtering. Higher is smoother but softer.");
+    add_number(right, "Temporal Frames", g_cvarHistory, 1, 96, 1, "",
+        "How many frames of light are accumulated. Higher is smoother when still; lower reacts "
+        "faster to moving lights and objects.");
+    add_select(right, "Debug View", g_cvarDebug, kDebug, 5,
+        "Visualize individual parts of the effect.");
+    return MOD_OK;
+}
+
+void on_controls_window_closed(ModContext*, UiWindowHandle, void*) {
+    g_controlsWindow = 0;
+}
+
+void on_open_controls(ModContext*, void*) {
+    if (g_controlsWindow != 0) {
+        return;
+    }
+    UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
+    tabs[0].title = "PathLight GI";
+    tabs[0].build = build_controls_tab;
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = 1;
+    desc.on_closed = on_controls_window_closed;
+    if (svc_ui->window_push(mod_ctx, &desc, &g_controlsWindow) != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to open PathLight GI controls window");
+    }
+}
+
+ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Enabled";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarEnabled;
+    add_control(panel, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_BUTTON;
+    control.label = "Open Controls";
+    control.on_pressed = on_open_controls;
+    add_control(panel, control);
+    return MOD_OK;
+}
+
+ModResult register_bool_option(
+    const char* name, bool defaultValue, ConfigVarHandle& outHandle, ModError* error) {
+    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = name;
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = defaultValue;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register option");
+    }
+    return MOD_OK;
+}
+
+ModResult register_int_option(
+    const char* name, int64_t defaultValue, ConfigVarHandle& outHandle, ModError* error) {
+    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = name;
+    cvarDesc.type = CONFIG_VAR_INT;
+    cvarDesc.default_int = defaultValue;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register option");
+    }
+    return MOD_OK;
+}
+
+ModResult load_shaders(ModError* error) {
+    struct Shader {
+        const char* file;
+        ResourceBuffer* buffer;
+    };
+    for (const Shader& shader : {Shader{"common.wgsl", &g_commonSource},
+             Shader{"trace.wgsl", &g_traceSource}, Shader{"temporal.wgsl", &g_temporalSource},
+             Shader{"denoise.wgsl", &g_denoiseSource},
+             Shader{"composite.wgsl", &g_compositeSource}})
+    {
+        const ModResult result = svc_resource->load(mod_ctx, shader.file, shader.buffer);
+        if (result != MOD_OK) {
+            return mods::set_error(error, result, "failed to load PathLight GI shaders");
+        }
+    }
+    return MOD_OK;
+}
+
+}  // namespace
+
+extern "C" {
+
+MOD_EXPORT ModResult mod_initialize(ModError* error) {
+    ModResult result = load_shaders(error);
+    if (result != MOD_OK) {
+        return result;
+    }
+
+    result = register_bool_option("enabled", true, g_cvarEnabled, error);
+    if (result == MOD_OK) result = register_int_option("quality", 2, g_cvarQuality, error);
+    if (result == MOD_OK) result = register_bool_option("halfRes", true, g_cvarHalfRes, error);
+    if (result == MOD_OK) result = register_int_option("intensity", 110, g_cvarIntensity, error);
+    if (result == MOD_OK) result = register_int_option("bounces", 60, g_cvarBounces, error);
+    if (result == MOD_OK) result = register_int_option("rayDistance", 600, g_cvarDistance, error);
+    if (result == MOD_OK) result = register_int_option("contactShadows", 60, g_cvarAo, error);
+    if (result == MOD_OK) result = register_int_option("colorBleeding", 100, g_cvarBleed, error);
+    if (result == MOD_OK) result = register_int_option("skyLight", 50, g_cvarSky, error);
+    if (result == MOD_OK) result = register_int_option("emissiveBoost", 50, g_cvarEmissive, error);
+    if (result == MOD_OK) result = register_int_option("denoise", 50, g_cvarDenoise, error);
+    if (result == MOD_OK) result = register_int_option("temporalFrames", 24, g_cvarHistory, error);
+    if (result == MOD_OK) result = register_int_option("debugView", 0, g_cvarDebug, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+
+    if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
+    }
+    if (!build_compute_pipeline(
+            "PathLight trace", g_traceSource, "trace", g_tracePipeline, g_traceLayout) ||
+        !build_compute_pipeline("PathLight temporal", g_temporalSource, "temporal",
+            g_temporalPipeline, g_temporalLayout) ||
+        !build_compute_pipeline(
+            "PathLight denoise", g_denoiseSource, "denoise", g_denoisePipeline, g_denoiseLayout))
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to create PathLight compute pipelines");
+    }
+
+    GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
+    computeDesc.label = "PathLight GI";
+    computeDesc.callback = on_compute;
+    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_computeType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
+    }
+    GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
+    drawDesc.label = "PathLight composite";
+    drawDesc.draw = on_draw;
+    if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_drawType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register draw type");
+    }
+    GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
+    stageDesc.callback = on_scene_after_opaque;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_afterOpaqueHook) != MOD_OK)
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
+
+    UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
+    panelDesc.build = build_panel;
+    svc_ui->register_mods_panel(mod_ctx, &panelDesc);
+
+    svc_log->info(mod_ctx, "PathLight GI ready");
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!g_loggedChain && g_chainExecuted.load(std::memory_order_acquire)) {
+        g_loggedChain = true;
+        svc_log->info(mod_ctx, "PathLight GI chain executed OK");
+    }
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_shutdown(ModError*) {
+    svc_resource->free(mod_ctx, &g_commonSource);
+    svc_resource->free(mod_ctx, &g_traceSource);
+    svc_resource->free(mod_ctx, &g_temporalSource);
+    svc_resource->free(mod_ctx, &g_denoiseSource);
+    svc_resource->free(mod_ctx, &g_compositeSource);
+
+    destroy_targets(g_targets);
+    g_targets = nullptr;
+    for (auto& retired : g_retired) {
+        destroy_targets(retired.targets);
+    }
+    g_retired.clear();
+
+    const auto releasePipeline = [](WGPUComputePipeline& pipeline) {
+        if (pipeline != nullptr) {
+            wgpuComputePipelineRelease(pipeline);
+            pipeline = nullptr;
+        }
+    };
+    const auto releaseLayout = [](WGPUBindGroupLayout& layout) {
+        if (layout != nullptr) {
+            wgpuBindGroupLayoutRelease(layout);
+            layout = nullptr;
+        }
+    };
+    releasePipeline(g_tracePipeline);
+    releasePipeline(g_temporalPipeline);
+    releasePipeline(g_denoisePipeline);
+    releaseLayout(g_traceLayout);
+    releaseLayout(g_temporalLayout);
+    releaseLayout(g_denoiseLayout);
+    release_composite();
+
+    g_cvarEnabled = g_cvarQuality = g_cvarHalfRes = g_cvarIntensity = g_cvarBounces = 0;
+    g_cvarDistance = g_cvarAo = g_cvarBleed = g_cvarSky = g_cvarEmissive = 0;
+    g_cvarDenoise = g_cvarHistory = g_cvarDebug = 0;
+    g_computeType = g_drawType = 0;
+    g_afterOpaqueHook = 0;
+    g_controlsWindow = 0;
+    g_havePrevCamera = false;
+    g_pingPong = 0;
+    g_frameIndex = 0;
+    return MOD_OK;
+}
+}

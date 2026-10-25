@@ -1,0 +1,7 @@
+{
+  "id": "dev.community.pathlight_gi",
+  "name": "PathLight GI",
+  "version": "1.0.0",
+  "author": "Community",
+  "description": "Real-time path-traced-style global illumination: Monte Carlo ray tracing in screen space with multi-bounce light, color bleeding, sky light, contact shadows, temporal accumulation and an edge-aware denoiser."
+}
