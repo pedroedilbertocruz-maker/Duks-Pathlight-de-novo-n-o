@@ -888,7 +888,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
 
-    result = register_bool_option("enabled", true, g_cvarEnabled, error);
+    result = register_bool_option("giEnabled", true, g_cvarEnabled, error);
     if (result == MOD_OK) result = register_int_option("quality", 2, g_cvarQuality, error);
     if (result == MOD_OK) result = register_bool_option("halfRes", true, g_cvarHalfRes, error);
     if (result == MOD_OK) result = register_int_option("intensity", 110, g_cvarIntensity, error);
