@@ -110,38 +110,73 @@ fn light_atten(d2: f32, r: f32) -> f32 {
     return win * win * (core * core) / (d2 + core * core);
 }
 
-// 0 = fully shadowed, 1 = lit. Marches the segment surface -> light through the depth buffer.
-fn light_shadow(p: vec3f, n: vec3f, lp: vec3f, pix: vec2u) -> f32 {
-    let steps = i32(u.l0.w);
-    if steps <= 0 {
+// Soft screen-space shadow. 0 = fully shadowed, 1 = lit.
+// The light is treated as a small disc (flames have size): a few rays per pixel go to jittered
+// points on that disc, each marching the segment surface -> light through the depth buffer. The
+// fraction of blocked rays gives a penumbra instead of a hard polygon edge. Shadows never become
+// fully black (light bounces around in real life) and fade out where the light is weak.
+const SHADOW_RAYS: i32 = 4;
+const SHADOW_FLOOR: f32 = 0.30;  // darkest a shadowed pixel can get, as a fraction of its lit value
+
+fn light_shadow(p: vec3f, n: vec3f, lp: vec3f, pix: vec2u, fade: f32) -> f32 {
+    let total_steps = i32(u.l0.w);
+    let strength = u.l0.z * fade;
+    if total_steps <= 0 || strength <= 0.001 {
         return 1.0;
     }
-    let origin = p + n * (0.004 * -p.z + 2.0);
-    let to = lp - origin;
-    let jitter = ign(pix);
-    let thick = max(u.a.y, 40.0);
-    var hits = 0.0;
-    for (var s = 0; s < steps; s++) {
-        let t = (f32(s) + jitter) / f32(steps) * 0.9;
-        let q = origin + to * t;
-        if q.z > -u.d.x {
-            break;
-        }
-        let uv = project_uv(q);
-        if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) {
-            continue;
-        }
-        let d = depth_at_uv(uv);
-        if d <= SKY_DEPTH_EPS {
-            continue;
-        }
-        let diff = -q.z - view_w(uv, d);
-        if diff > -q.z * 0.01 + 2.0 && diff < thick {
-            hits += 1.0;
-        }
+    let steps = max(total_steps / 2, 4);
+    // Push the start off the surface (more at grazing angles) so flat ground never shadows itself.
+    let dist_view = -p.z;
+    let toward = normalize(lp - p);
+    let graze = 1.0 - clamp(dot(n, toward), 0.0, 1.0);
+    let origin = p + n * (0.006 * dist_view + 2.5 + 6.0 * graze);
+    let full = lp - origin;
+    let full_len = length(full);
+    let dir = full / max(full_len, 1e-3);
+
+    // Light "size" -> penumbra width. About 7% of the distance, between 8 and 70 world units.
+    let size = clamp(full_len * 0.07, 8.0, 70.0);
+    var up = vec3f(0.0, 1.0, 0.0);
+    if abs(dir.y) > 0.9 {
+        up = vec3f(1.0, 0.0, 0.0);
     }
-    let occluded = clamp(hits * 3.0 / f32(steps), 0.0, 1.0);
-    return 1.0 - occluded * u.l0.z;
+    let t1 = normalize(cross(dir, up));
+    let t2 = cross(dir, t1);
+
+    let jitter = ign(pix);
+    let jitter2 = ign(pix + vec2u(17u, 59u));
+    let thick = max(u.a.y, 40.0);
+    var blocked = 0.0;
+    for (var r = 0; r < SHADOW_RAYS; r++) {
+        let ang = (f32(r) + jitter2) * 2.39996323 + jitter * TAU;
+        let rad = sqrt((f32(r) + 0.5) / f32(SHADOW_RAYS)) * size;
+        let aim = lp + t1 * (cos(ang) * rad) + t2 * (sin(ang) * rad);
+        let to = aim - origin;
+        var hits = 0.0;
+        for (var s = 0; s < steps; s++) {
+            let t = (f32(s) + fract(jitter + f32(r) * 0.618034)) / f32(steps) * 0.92;
+            let q = origin + to * t;
+            if q.z > -u.d.x {
+                break;
+            }
+            let uv = project_uv(q);
+            if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) {
+                continue;
+            }
+            let d = depth_at_uv(uv);
+            if d <= SKY_DEPTH_EPS {
+                continue;
+            }
+            let diff = -q.z - view_w(uv, d);
+            if diff > -q.z * 0.012 + 3.0 && diff < thick {
+                hits += 1.0;
+            }
+        }
+        // A ray is blocked once a couple of its samples land behind geometry.
+        blocked += clamp(hits * 0.7, 0.0, 1.0);
+    }
+    let occluded = blocked / f32(SHADOW_RAYS);
+    return 1.0 - occluded * strength * (1.0 - SHADOW_FLOOR);
 }
 
 // Returns rgb = incoming light (before albedo) and a = coverage 0..1 (how much of the original
@@ -165,8 +200,12 @@ fn light_field(p: vec3f, n: vec3f, pix: vec2u, shadows: bool) -> vec4f {
         let l = to * inverseSqrt(max(d2, 1e-4));
         let ndl = clamp(dot(n, l) * 0.8 + 0.2, 0.0, 1.0); // wrapped lambert: soft terminator
         var vis = 1.0;
-        if shadows && budget > 0 && att * ndl * max(lc.r, max(lc.g, lc.b)) > 0.02 {
-            vis = light_shadow(p, n, lp.xyz, pix);
+        // No shadows for huge room lights (they act as fill, and would cast enormous hard shadows)
+        // or for sword-spark flashes (too brief to matter). Shadows fade out where the light is weak.
+        if shadows && budget > 0 && r < 1100.0 && lc.w < 1.5 &&
+            att * ndl * max(lc.r, max(lc.g, lc.b)) > 0.02
+        {
+            vis = light_shadow(p, n, lp.xyz, pix, clamp(att * 7.0, 0.0, 1.0));
             budget -= 1;
         }
         irr += lc.rgb * (att * ndl * vis);
