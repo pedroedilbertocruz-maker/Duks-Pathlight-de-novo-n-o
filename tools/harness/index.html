@@ -106,6 +106,15 @@ function shadowed(p, n) {
 }
 let SCENE = 'cornell';
 let TORCHES = [];
+let FOG = null;  // { start, end, color:[r,g,b], k:[10] (already /64, pair-swapped), center }
+function fogLut(xNdc) {
+  const off = xNdc - FOG.center;
+  const idx = Math.min(9, Math.max(0, 9 - Math.abs(off) * 9));
+  const lo = Math.floor(idx), hi = Math.min(lo + 1, 9), fr = idx - lo;
+  const k = Math.max(FOG.k[lo] * (1 - fr) + FOG.k[hi] * fr, 1e-6);
+  return Math.sqrt(off * off + k * k) / k;
+}
+function fogFactor(xNdc, z) { return Math.min(1, Math.max(0, (z * fogLut(xNdc) - FOG.start) / Math.max(FOG.end - FOG.start, 1))); }
 function torchAtt(d2, r) { const x = d2 / (r*r); if (x >= 1) return 0; const w = 1 - x, core = r * 0.22; return w*w*core*core/(d2+core*core); }
 function shade(p, n, albedo) {
   if (SCENE === 'cave') {
@@ -157,7 +166,8 @@ function renderGBuffer(cam) {
     const nv = [v3.dot(best.n, cam.right), v3.dot(best.n, cam.up), -v3.dot(best.n, cam.fwd)];
     normal[i*4] = Math.round((nv[0]*0.5+0.5)*255); normal[i*4+1] = Math.round((nv[1]*0.5+0.5)*255);
     normal[i*4+2] = Math.round((nv[2]*0.5+0.5)*255); normal[i*4+3] = 255;
-    const c = best.emissive ? best.albedo : shade(p, best.n, best.albedo);
+    let c = best.emissive ? best.albedo : shade(p, best.n, best.albedo);
+    if (FOG) { const f = fogFactor(nx, -zv); c = c.map((v, k) => v * (1 - f) + FOG.color[k] * f); }
     color[i*4] = Math.round(c[0]*255); color[i*4+1] = Math.round(c[1]*255); color[i*4+2] = Math.round(c[2]*255); color[i*4+3] = 255;
   }
   return { depth, normal, color };
@@ -169,6 +179,10 @@ async function fetchText(u) { return (await fetch(u)).text(); }
 window.runTest = async function (opts) {
   const log = []; OPEN = !!opts.open;
   SCENE = opts.scene || 'cornell'; TORCHES = opts.torches || [];
+  FOG = null;
+  if (opts.fog) { const r = opts.fog.range === false ? null : (opts.fog.table || [260, 260, 270, 280, 290, 300, 310, 320, 330, 340]);
+    FOG = { start: opts.fog.start, end: opts.fog.end, color: opts.fog.color, center: opts.fog.center || 0,
+            k: r ? Array.from({ length: 10 }, (_, i) => r[i ^ 1] / 64) : new Array(10).fill(1e6) }; }
   if (SCENE === 'cave') { WALL_COL = WALL_COL_CAVE; BOXES.splice(0, BOXES.length, ...CAVE_BOXES); OPEN = false; } else { WALL_COL = WALL_COL_CORNELL; }
   const adapter = await navigator.gpu.requestAdapter();
   const device = await adapter.requestDevice();
@@ -205,7 +219,7 @@ window.runTest = async function (opts) {
   const raw = gi(), accum = [gi(), gi()], metas = [meta(), meta()], tmpA = gi(), tmpB = gi(), final = gi();
   const view = t => t.createView();
 
-  const UB = 1424;
+  const UB = 1504;
   function packUniforms(cam, prevCam, frame, step, histValid) {
     const buf = new ArrayBuffer(UB), f = new Float32Array(buf), ui = new Uint32Array(buf);
     f.set(cam.proj, 0); f.set(cam.invProj, 16); f.set(cam.worldFromView, 32); f.set(prevCam ? prevCam.projFromWorld : cam.projFromWorld, 48);
@@ -219,10 +233,14 @@ window.runTest = async function (opts) {
     const lights = (opts.scene === 'cave' ? opts.lightList : []) || [];
     f.set([dk.scale, dk.gain, dk.shadow, dk.steps], 92);
     f.set([lights.length, dk.restore, 0, frame * 0.033], 96);
+    const fogStrength = opts.fogStrength === undefined ? 1 : opts.fogStrength;
+    f.set(FOG ? [FOG.start, FOG.end, 1, FOG.center] : [0, 1, 0, 0], 100);
+    f.set(FOG ? [FOG.color[0], FOG.color[1], FOG.color[2], fogStrength] : [0, 0, 0, 0], 104);
+    if (FOG) f.set(FOG.k, 108);
     lights.forEach((l, k) => {
       const vp = [0, 1, 2].map(r => cam.view[r] * l.pos[0] + cam.view[4 + r] * l.pos[1] + cam.view[8 + r] * l.pos[2] + cam.view[12 + r]);
-      f.set([vp[0], vp[1], vp[2], l.radius], 100 + 8 * k);
-      f.set([l.color[0], l.color[1], l.color[2], l.kind || 0], 104 + 8 * k);
+      f.set([vp[0], vp[1], vp[2], l.radius], 120 + 8 * k);
+      f.set([l.color[0], l.color[1], l.color[2], l.kind || 0], 132 + 8 * k);
     });
     return buf;
   }

@@ -55,16 +55,3 @@ struct FogSnapshot {
 
 // Must be called on the game thread. `gameViewport` is GfxStageContext::game_viewport (may be null).
 void collect_fog(const void* gameViewport, FogSnapshot& out);
-
-// Sun (day) or moon (night) as a shadow-casting directional light, from the game's clock.
-struct SunSnapshot {
-    bool valid = false;       // false indoors / in caves / when the sun and moon are both down
-    float dir[3] = {};        // world-space unit vector pointing TOWARD the light
-    float strength = 0.0f;    // 0..1, fades near the horizon and for the weaker moon
-    bool isMoon = false;      // the light is the moon, not the sun
-    bool linkValid = false;   // Link (or the wolf) is present: exclude him, the game draws his shadow
-    float linkPos[3] = {};    // world-space position of his feet
-};
-
-// Must be called on the game thread. `eye` is the world-space camera position.
-void collect_sun(const float eye[3], SunSnapshot& out);

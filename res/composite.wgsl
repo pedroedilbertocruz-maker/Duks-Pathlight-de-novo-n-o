@@ -62,10 +62,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(select(vec3f(0.0), nrm.xyz, nrm.a >= 0.5), 1.0);
     }
     if is_sky(depth, nrm) {
-        if u.i.w != 0u {
-            return vec4f(0.0, 0.0, 0.0, 1.0);
-        }
-        return vec4f(sun_rays(in.uv, vec2u(in.position.xy), true), 0.0);  // dst + glow
+        return select(vec4f(0.0), vec4f(0.0, 0.0, 0.0, 1.0), u.i.w != 0u);
     }
     let color = textureLoad(color_tex, tex_px(textureDimensions(color_tex), in.uv), 0).rgb;
     let gi = upsample_gi(in.uv, view_w(in.uv, depth));
@@ -97,24 +94,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     // premultiplied: out = rgb + dst * (1 - a)  =>  dst * m + light, with m = scale * (1 - occlusion).
     // dst already contains the game's fog. Darkening scaled that fog by m, so add back the lost part
     // (1 - m) * fog and hide the lights behind fog: the haze stays as bright as in the original.
-    let ss = sun_shadow(p, n, vec2u(in.position.xy));
-    let m = scale * (1.0 - occlusion) * ss;
-
-    // Sun colour: warm light on surfaces that face the sun and are not in shadow, cool skylight in
-    // cast shadows, plus the rays / bloom. All "screen"-style so nothing blows out.
-    let room_for_rays = vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95));
-    var sunlight = vec3f(0.0);
-    if u.sun0.w > 0.001 {
-        let ndl = clamp(dot(n, normalize(u.sun0.xyz)), 0.0, 1.0);
-        let lit = clamp((ss - u.sun1.y) / max(1.0 - u.sun1.y, 1e-3), 0.0, 1.0);
-        let room = vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95));
-        let warm = albedo * u.sun2.rgb * (ndl * lit * 0.14 * u.sun2.w * u.sun0.w);
-        let cool = albedo * vec3f(0.32, 0.5, 0.95) * ((1.0 - lit) * 0.10 * u.sun2.w * u.sun0.w);
-        sunlight = (warm + cool) * room;
-    }
-    let rays = sun_rays(in.uv, vec2u(in.position.xy), false) * room_for_rays;
+    let m = scale * (1.0 - occlusion);
     let fog_f = fog_factor(in.uv.x, -p.z);
     let fog_hide = clamp(fog_f * u.fog1.w, 0.0, 1.0);
     let fog_back = (1.0 - m) * fog_f * u.fog1.w * u.fog1.rgb;
-    return vec4f((indirect + direct + sunlight) * (1.0 - fog_hide) + fog_back + rays, 1.0 - m);
+    return vec4f((indirect + direct) * (1.0 - fog_hide) + fog_back, 1.0 - m);
 }
