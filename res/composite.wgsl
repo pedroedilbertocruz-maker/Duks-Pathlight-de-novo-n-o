@@ -91,6 +91,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         case 6u: { return vec4f(vec3f(scale), 1.0); }
         default: {}
     }
-    // premultiplied: out = rgb + dst * (1 - a)  =>  dst * scale * (1 - occlusion) + light
-    return vec4f(indirect + direct, 1.0 - scale * (1.0 - occlusion));
+    // premultiplied: out = rgb + dst * (1 - a)  =>  dst * m + light, with m = scale * (1 - occlusion).
+    // dst already contains the game's fog. Darkening scaled that fog by m, so add back the lost part
+    // (1 - m) * fog and hide the lights behind fog: the haze stays as bright as in the original.
+    let m = scale * (1.0 - occlusion);
+    let fog_f = fog_factor(in.uv.x, -p.z);
+    let fog_hide = clamp(fog_f * u.fog1.w, 0.0, 1.0);
+    let fog_back = (1.0 - m) * fog_f * u.fog1.w * u.fog1.rgb;
+    return vec4f((indirect + direct) * (1.0 - fog_hide) + fog_back, 1.0 - m);
 }

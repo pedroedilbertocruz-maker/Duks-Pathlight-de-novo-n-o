@@ -21,6 +21,9 @@ struct Uniforms {
     i: vec4u,      // frame_index, rays_per_pixel, steps_per_ray, debug_view
     l0: vec4f,     // ambient_scale (1 = no darkening), light_gain, shadow_strength, shadow_steps
     l1: vec4f,     // light_count, restore (how much game lighting returns near lights), unused, time
+    fog0: vec4f,   // fog_start, fog_end, fog_enabled (0/1), range_center (NDC x)
+    fog1: vec4f,   // fog colour rgb (0..1), fog_strength
+    fogk: array<vec4f, 3>, // fog range-adjust table (10 values, already /64 and pair-swapped)
     // Scene lights in VIEW space: [2k] = pos.xyz, radius ; [2k+1] = rgb (flicker applied), kind
     lights: array<vec4f, 64>,
 }
@@ -217,4 +220,31 @@ fn light_field(p: vec3f, n: vec3f, pix: vec2u, shadows: bool) -> vec4f {
 // Scene colour after darkness + lights: what a surface of colour `c` looks like at point p.
 fn scene_scale(cover: f32) -> f32 {
     return mix(u.l0.x, 1.0, clamp(cover * u.l1.y, 0.0, 1.0));
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Fog. The game's own fog is baked into the scene colour by the renderer (per draw, linear in view
+// depth). Darkening a fogged pixel would remove its fog, so after darkness/lights we put back the
+// fog that was lost. Same formula as Aurora's GX fog (PERSP_LIN + range adjust), so the result
+// looks like fog applied *after* lighting ("deferred fog").
+// ---------------------------------------------------------------------------------------------
+
+fn fog_k(i: u32) -> f32 {
+    return u.fogk[i >> 2u][i & 3u];
+}
+
+// 0 = no fog, 1 = fully fogged. `z` is the distance along the view axis.
+fn fog_factor(uv_x: f32, z: f32) -> f32 {
+    if u.fog0.z < 0.5 {
+        return 0.0;
+    }
+    let off = (uv_x * 2.0 - 1.0) - u.fog0.w;
+    let idx = clamp(9.0 - abs(off) * 9.0, 0.0, 9.0);
+    let lo = u32(idx);
+    let hi = min(lo + 1u, 9u);
+    let fr = idx - f32(lo);
+    let k = max(fog_k(lo) * (1.0 - fr) + fog_k(hi) * fr, 0.000001);
+    let lut = sqrt(off * off + k * k) / k;
+    return clamp((z * lut - u.fog0.x) / max(u.fog0.y - u.fog0.x, 1.0), 0.0, 1.0);
 }

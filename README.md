@@ -31,7 +31,16 @@ Mod nativo para o [Dusklight](https://github.com/TwilitRealm/dusklight) com duas
 | Light Shadows | Objetos bloqueiam a luz e projetam sombras |
 | Flame Flicker | Tremulação das chamas |
 | Sword Sparks | Clarão ao acertar com a espada |
+| Keep Fog | Mantém a névoa do jogo (efeito "Deferred Fog") mesmo com o ambiente escurecido |
+| Fog Strength | Intensidade da névoa restaurada (100% = igual ao jogo original) |
 | Debug View | Mostra "Dynamic light only" e "Darkness scale" para ajustes |
+
+## Névoa (substitui o mod Deferred Fog)
+
+Escurecer a cena também escurecia a névoa do jogo e o efeito de neblina sumia. O PathLight GI agora
+lê a névoa real do jogo (início, fim, cor e ajuste de alcance) e a recoloca **depois** da iluminação,
+com a mesma fórmula do renderer. **Desative o mod Deferred Fog** ao usar este: os dois juntos
+causam as sombras estranhas.
 
 ## Instalação (jogador)
 

@@ -75,6 +75,8 @@ ConfigVarHandle g_cvarLightRadius = 0;
 ConfigVarHandle g_cvarShadows = 0;
 ConfigVarHandle g_cvarFlicker = 0;
 ConfigVarHandle g_cvarSparks = 0;
+ConfigVarHandle g_cvarKeepFog = 0;
+ConfigVarHandle g_cvarFogStrength = 0;
 
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -147,9 +149,12 @@ struct GiUniforms {
     uint32_t i[4];  // frame_index, rays_per_pixel, steps_per_ray, debug_view
     float l0[4];    // ambient_scale, light_gain, shadow_strength, shadow_steps
     float l1[4];    // light_count, restore, unused, time
+    float fog0[4];  // fog_start, fog_end, fog_enabled, range_center
+    float fog1[4];  // fog rgb, fog_strength
+    float fogk[12]; // fog range-adjust table (10 used)
     float lights[64 * 4];  // view-space pos + radius, then rgb + kind, per light
 };
-static_assert(sizeof(GiUniforms) == 368 + 32 + 1024, "GiUniforms must match res/common.wgsl");
+static_assert(sizeof(GiUniforms) == 368 + 32 + 80 + 1024, "GiUniforms must match res/common.wgsl");
 static_assert(sizeof(GiUniforms) % 16 == 0);
 
 struct ComputePayload {
@@ -578,6 +583,7 @@ struct FrameLights {
     float lights[64 * 4] = {};
 };
 FrameLights g_frameLights;
+FogSnapshot g_frameFog;
 float g_darkAmount = 0.0f;  // smoothed 0..1 "how dark is this place"
 bool g_darkInit = false;
 std::chrono::steady_clock::time_point g_darkTime;
@@ -591,9 +597,13 @@ float smooth_flicker(const SceneLight& l, float t, float flickerOption) {
     return 1.0f + n * amount;
 }
 
-void prepare_frame_lights(const CameraInfo& camera) {
+void prepare_frame_lights(const CameraInfo& camera, const void* gameViewport) {
     FrameLights& f = g_frameLights;
     f = FrameLights{};
+    collect_fog(gameViewport, g_frameFog);
+    if (!get_bool_option(g_cvarKeepFog, true)) {
+        g_frameFog.valid = false;
+    }
 
     const auto now = std::chrono::steady_clock::now();
     float dt = 1.0f / 60.0f;
@@ -716,6 +726,16 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
     u.l1[1] = 0.7f;  // how much of the game's own lighting returns near a light
     u.l1[2] = 0.0f;
     u.l1[3] = 0.0f;
+    const FogSnapshot& fog = g_frameFog;
+    u.fog0[0] = fog.start;
+    u.fog0[1] = fog.end;
+    u.fog0[2] = fog.valid ? 1.0f : 0.0f;
+    u.fog0[3] = fog.centerNdc;
+    u.fog1[0] = fog.color[0];
+    u.fog1[1] = fog.color[1];
+    u.fog1[2] = fog.color[2];
+    u.fog1[3] = percent(g_cvarFogStrength, 100, 0, 200);
+    std::memcpy(u.fogk, fog.k, sizeof(fog.k));
     std::memcpy(u.lights, f.lights, sizeof(u.lights));
 }
 
@@ -782,7 +802,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const uint32_t debugView =
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 6));
 
-    prepare_frame_lights(camera);
+    prepare_frame_lights(camera, stageCtx->game_viewport);
 
     // One uniform block per dispatch group (trace/temporal, then three denoise strides).
     GiUniforms uniforms{};
@@ -930,6 +950,11 @@ ModResult build_controls_tab(
         "How much torch and lantern light flickers.");
     add_toggle(left, "Sword Sparks", g_cvarSparks,
         "A brief flash of light where your sword hits something.");
+    add_toggle(left, "Keep Fog", g_cvarKeepFog,
+        "Puts the game's fog back after darkening, so haze stays visible in dark places. Same idea "
+        "as the Deferred Fog mod: turn that mod OFF while this is on, or fog is applied twice.");
+    add_number(left, "Fog Strength", g_cvarFogStrength, 0, 200, 10, "%",
+        "How strongly the restored fog shows.");
 
     svc_ui->pane_add_section(mod_ctx, right, "Denoiser");
     add_number(right, "Denoise Strength", g_cvarDenoise, 0, 100, 5, "%",
@@ -1050,6 +1075,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_int_option("lightShadows", 100, g_cvarShadows, error);
     if (result == MOD_OK) result = register_int_option("flameFlicker", 100, g_cvarFlicker, error);
     if (result == MOD_OK) result = register_bool_option("swordSparks", true, g_cvarSparks, error);
+    if (result == MOD_OK) result = register_bool_option("keepFog", true, g_cvarKeepFog, error);
+    if (result == MOD_OK) result = register_int_option("fogStrength", 100, g_cvarFogStrength, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1142,6 +1169,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarDenoise = g_cvarHistory = g_cvarDebug = 0;
     g_cvarDarkMode = g_cvarDarkness = g_cvarLightGain = g_cvarLightRadius = 0;
     g_cvarShadows = g_cvarFlicker = g_cvarSparks = 0;
+    g_cvarKeepFog = g_cvarFogStrength = 0;
     g_darkInit = false;
     g_darkAmount = 0.0f;
     g_computeType = g_drawType = 0;

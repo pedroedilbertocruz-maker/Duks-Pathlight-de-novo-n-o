@@ -42,3 +42,16 @@ struct LightSnapshot {
 // Must be called on the game thread. `eye` (world space) is used to keep the closest lights when
 // more than kMaxSceneLights are active.
 void collect_scene_lights(const float eye[3], LightSnapshot& out);
+
+// The game's current scene fog (what the renderer bakes into every fogged draw).
+struct FogSnapshot {
+    bool valid = false;
+    float start = 0.0f;       // view-space distance where fog begins
+    float end = 1.0f;         // ... and where it is complete
+    float color[3] = {};      // 0..1
+    float centerNdc = 0.0f;   // range-adjust centre in NDC x (-1..1)
+    float k[10] = {};         // range-adjust table, already divided by 64 and pair-swapped
+};
+
+// Must be called on the game thread. `gameViewport` is GfxStageContext::game_viewport (may be null).
+void collect_fog(const void* gameViewport, FogSnapshot& out);

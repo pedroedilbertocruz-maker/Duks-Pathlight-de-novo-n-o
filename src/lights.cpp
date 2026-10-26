@@ -189,3 +189,41 @@ void collect_scene_lights(const float eye[3], LightSnapshot& out) {
     }
     out.count = candidateCount;
 }
+
+void collect_fog(const void* gameViewport, FogSnapshot& out) {
+    out = FogSnapshot{};
+    dScnKy_env_light_c* env = dKy_getEnvlight();
+    if (env == nullptr) {
+        return;
+    }
+    const float start = env->mFogNear;
+    const float end = env->mFogFar;
+    if (!(end > start) || start < 0.0f) {
+        return;
+    }
+    out.start = start;
+    out.end = end;
+    out.color[0] = clamp01(static_cast<float>(env->fog_col.r) / 255.0f);
+    out.color[1] = clamp01(static_cast<float>(env->fog_col.g) / 255.0f);
+    out.color[2] = clamp01(static_cast<float>(env->fog_col.b) / 255.0f);
+
+    // Range adjust: Aurora scales fog by a per-screen-column factor built from this table.
+    if (env->mFogAdjEnable) {
+        float cx = 0.0f;
+        if (gameViewport != nullptr) {
+            const view_port_class* vp = static_cast<const view_port_class*>(gameViewport);
+            if (vp->width > 1.0f) {
+                cx = (static_cast<float>(env->mFogAdjCenter) - vp->x_orig) / vp->width * 2.0f - 1.0f;
+            }
+        }
+        out.centerNdc = cx;
+        for (int i = 0; i < 10; ++i) {
+            out.k[i] = static_cast<float>(env->mXFogTbl.r[i ^ 1]) / 64.0f;
+        }
+    } else {
+        for (float& k : out.k) {
+            k = 1.0e6f;  // factor -> 1: no range adjustment
+        }
+    }
+    out.valid = true;
+}
