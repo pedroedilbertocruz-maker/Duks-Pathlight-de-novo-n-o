@@ -188,6 +188,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3u) {
             var l = c * scene_scale(lfh.a) + c * (u.b.w * smoothstep(0.6, 1.0, luma(c)) * 2.0);
             l += albedo_proxy(c) * lfh.rgb * u.l0.y;                // torch light bouncing on
             l += albedo_proxy(c) * prev_gi_at_uv(hit.uv) * u.a.w; // additional bounces
+            // Coloured emitters (lava, lamps, magic flames): bright + saturated pixels light their
+            // surroundings in their own colour, even when their luma is modest (orange lava).
+            let mx = max(c.r, max(c.g, c.b));
+            let chroma = (mx - min(c.r, min(c.g, c.b))) / max(mx, 1e-3);
+            let emit = smoothstep(0.58, 0.92, mx) * smoothstep(0.25, 0.65, chroma);
+            l += (c / max(mx, 1e-3)) * (emit * u.d.w * 3.0);
             l = min(l, vec3f(4.0));
             let fade = 1.0 - smoothstep(0.7, 1.0, hit.dist / u.a.x);
             radiance += l * fade;

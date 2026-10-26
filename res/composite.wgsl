@@ -74,7 +74,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         n = -n;
     }
     let lf = light_field(p, n, vec2u(in.position.xy), true);
-    let scale = scene_scale(lf.a);
+    var scale = scene_scale(lf.a);
+    if u.d.w > 0.0 {
+        // Bright coloured emitters (lava, lamps, magic flames) are light sources: never darkened.
+        let mx = max(color.r, max(color.g, color.b));
+        let chroma = (mx - min(color.r, min(color.g, color.b))) / max(mx, 1e-3);
+        let emit = smoothstep(0.58, 0.92, mx) * smoothstep(0.25, 0.65, chroma);
+        scale = mix(scale, 1.0, clamp(emit * min(u.d.w, 1.0), 0.0, 1.0));
+    }
     let albedo = albedo_proxy(color);
     let base = color * scale;
     // Light reaching the surface is tinted by its albedo; "screen"-style so it never blows out.

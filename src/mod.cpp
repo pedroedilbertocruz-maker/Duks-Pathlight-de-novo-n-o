@@ -64,6 +64,7 @@ ConfigVarHandle g_cvarAo = 0;
 ConfigVarHandle g_cvarBleed = 0;
 ConfigVarHandle g_cvarSky = 0;
 ConfigVarHandle g_cvarEmissive = 0;
+ConfigVarHandle g_cvarEmissiveColor = 0;
 ConfigVarHandle g_cvarDenoise = 0;
 ConfigVarHandle g_cvarHistory = 0;
 ConfigVarHandle g_cvarDebug = 0;
@@ -708,7 +709,7 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
     u.d[0] = std::max(camera.near_plane, 0.01f);
     u.d[1] = historyValid ? 1.0f : 0.0f;
     u.d[2] = 1.0f;
-    u.d[3] = 0.0f;
+    u.d[3] = percent(g_cvarEmissiveColor, 100, 0, 300);
 
     uint32_t rays = 2, steps = 24;
     quality_counts(get_int_option(g_cvarQuality, 2), rays, steps);
@@ -931,6 +932,8 @@ ModResult build_controls_tab(
         "0 = bounce light is neutral, 100 = tinted by the color of nearby surfaces.");
     add_number(right, "Sky Light", g_cvarSky, 0, 300, 10, "%",
         "How much visible sky lights the scene.");
+    add_number(right, "Emissive Light", g_cvarEmissiveColor, 0, 300, 10, "%",
+        "Lava, lamps and coloured flames light up Link and the area around them in their own colour.");
     add_number(right, "Emissive Boost", g_cvarEmissive, 0, 300, 10, "%",
         "Extra bounce light from very bright pixels such as lamps, fire and magic.");
 
@@ -1066,6 +1069,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_int_option("colorBleeding", 100, g_cvarBleed, error);
     if (result == MOD_OK) result = register_int_option("skyLight", 50, g_cvarSky, error);
     if (result == MOD_OK) result = register_int_option("emissiveBoost", 50, g_cvarEmissive, error);
+    if (result == MOD_OK) result = register_int_option("emissiveLight", 100, g_cvarEmissiveColor, error);
     if (result == MOD_OK) result = register_int_option("denoise", 50, g_cvarDenoise, error);
     if (result == MOD_OK) result = register_int_option("temporalFrames", 24, g_cvarHistory, error);
     if (result == MOD_OK) result = register_int_option("debugView", 0, g_cvarDebug, error);
@@ -1166,7 +1170,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     release_composite();
 
     g_cvarEnabled = g_cvarQuality = g_cvarHalfRes = g_cvarIntensity = g_cvarBounces = 0;
-    g_cvarDistance = g_cvarAo = g_cvarBleed = g_cvarSky = g_cvarEmissive = 0;
+    g_cvarDistance = g_cvarAo = g_cvarBleed = g_cvarSky = g_cvarEmissive = g_cvarEmissiveColor = 0;
     g_cvarDenoise = g_cvarHistory = g_cvarDebug = 0;
     g_cvarDarkMode = g_cvarDarkness = g_cvarLightGain = g_cvarLightRadius = 0;
     g_cvarShadows = g_cvarFlicker = g_cvarSparks = 0;

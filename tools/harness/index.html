@@ -149,7 +149,7 @@ function renderGBuffer(cam) {
     if (dir[0] < 0) consider((ROOM.x0 - cam.eye[0]) / dir[0], [1,0,0], WALL_COL.left);
     if (dir[0] > 0) consider((ROOM.x1 - cam.eye[0]) / dir[0], [-1,0,0], WALL_COL.right);
     if (dir[2] < 0) consider((ROOM.z0 - cam.eye[2]) / dir[2], [0,0,1], WALL_COL.other);
-    for (const b of BOXES) { const h = rayBox(cam.eye, dir, b.min, b.max); if (h) consider(h.t, h.n, b.albedo); }
+    for (const b of BOXES) { const h = rayBox(cam.eye, dir, b.min, b.max); if (h) consider(h.t, h.n, b.albedo, !!b.emissive); }
     const lamp = SCENE === 'cave' ? null : rayBox(cam.eye, dir, LAMP.min, LAMP.max); if (lamp && (!best || lamp.t < best.t)) consider(lamp.t, lamp.n, [1,1,0.9], true);
     const i = y*W + x;
     if (!best) { // sky
@@ -183,7 +183,7 @@ window.runTest = async function (opts) {
   if (opts.fog) { const r = opts.fog.range === false ? null : (opts.fog.table || [260, 260, 270, 280, 290, 300, 310, 320, 330, 340]);
     FOG = { start: opts.fog.start, end: opts.fog.end, color: opts.fog.color, center: opts.fog.center || 0,
             k: r ? Array.from({ length: 10 }, (_, i) => r[i ^ 1] / 64) : new Array(10).fill(1e6) }; }
-  if (SCENE === 'cave') { WALL_COL = WALL_COL_CAVE; BOXES.splice(0, BOXES.length, ...CAVE_BOXES); OPEN = false; } else { WALL_COL = WALL_COL_CORNELL; }
+  if (SCENE === 'cave') { WALL_COL = WALL_COL_CAVE; BOXES.splice(0, BOXES.length, ...CAVE_BOXES); OPEN = false; if (opts.lava) BOXES.push(...opts.lava.map(b => ({ min: b.min, max: b.max, albedo: b.albedo, emissive: true }))); } else { WALL_COL = WALL_COL_CORNELL; }
   const adapter = await navigator.gpu.requestAdapter();
   const device = await adapter.requestDevice();
   const errors = [];
@@ -227,7 +227,7 @@ window.runTest = async function (opts) {
     f.set([opts.rayLength, opts.thickness, opts.intensity, opts.bounce], 72);
     f.set([opts.aoRadius, opts.aoStrength, opts.sky, opts.emissive], 76);
     f.set([opts.bleed, opts.historyFrames, opts.clampK, opts.denoise], 80);
-    f.set([NEAR, histValid ? 1 : 0, step, 0], 84);
+    f.set([NEAR, histValid ? 1 : 0, step, opts.emitLight || 0], 84);
     ui.set([frame, opts.rays, opts.steps, opts.debug || 0], 88);
     const dk = opts.dark || { scale: 1, gain: 1, shadow: 1, steps: 0, restore: 0.7 };
     const lights = (opts.scene === 'cave' ? opts.lightList : []) || [];

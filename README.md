@@ -33,6 +33,7 @@ Mod nativo para o [Dusklight](https://github.com/TwilitRealm/dusklight) com duas
 | Sword Sparks | Clarão ao acertar com a espada |
 | Keep Fog | Mantém a névoa do jogo (efeito "Deferred Fog") mesmo com o ambiente escurecido |
 | Fog Strength | Intensidade da névoa restaurada (100% = igual ao jogo original) |
+| Emissive Light | Lava, lâmpadas e chamas coloridas iluminam o Link e o cenário na própria cor (e não escurecem no modo escuro) |
 | Debug View | Mostra "Dynamic light only" e "Darkness scale" para ajustes |
 
 ## Névoa (substitui o mod Deferred Fog)
