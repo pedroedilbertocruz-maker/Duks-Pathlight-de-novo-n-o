@@ -1,17 +1,36 @@
 // PathLight GI - game-side light gathering (see lights.h).
 
+// IMPORTANT: standard headers must come BEFORE any game header. On MSVC the game's types.h defines
+// `nullptr` as `NULL` (MSVC reports __cplusplus < 201103 by default), which breaks every standard
+// header that is included afterwards.
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <new>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
 #include "global.h"
 
 #include "d/actor/d_a_alink.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_kankyo.h"
 
-#include "lights.h"
+// Restore the real keyword for the rest of this file.
+#ifdef nullptr
+#undef nullptr
+#endif
 
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstring>
+#include "lights.h"
 
 namespace {
 
