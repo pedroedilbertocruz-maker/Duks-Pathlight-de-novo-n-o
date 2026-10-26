@@ -24,6 +24,8 @@ struct Uniforms {
     fog0: vec4f,   // fog_start, fog_end, fog_enabled (0/1), range_center (NDC x)
     fog1: vec4f,   // fog colour rgb (0..1), fog_strength
     fogk: array<vec4f, 3>, // fog range-adjust table (10 values, already /64 and pair-swapped)
+    sun0: vec4f,   // direction TO the sun/moon in view space (xyz), strength 0..1 (0 = off)
+    sun1: vec4f,   // march length (world units), shadow floor (darkest lit fraction), steps, unused
     // Scene lights in VIEW space: [2k] = pos.xyz, radius ; [2k+1] = rgb (flicker applied), kind
     lights: array<vec4f, 64>,
 }
@@ -247,4 +249,71 @@ fn fog_factor(uv_x: f32, z: f32) -> f32 {
     let k = max(fog_k(lo) * (1.0 - fr) + fog_k(hi) * fr, 0.000001);
     let lut = sqrt(off * off + k * k) / k;
     return clamp((z * lut - u.fog0.x) / max(u.fog0.y - u.fog0.x, 1.0), 0.0, 1.0);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Sun / moon shadows. Same idea as the torch shadows: march from the surface toward the sun through
+// the depth buffer; a few jittered rays across the sun's disc give soft edges. Only surfaces facing
+// the sun are darkened (the others already are in shade). Returns 1 = lit .. sun1.y = shadowed.
+// ---------------------------------------------------------------------------------------------
+
+fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
+    let strength = u.sun0.w;
+    if strength <= 0.001 {
+        return 1.0;
+    }
+    let sdir = normalize(u.sun0.xyz);
+    let ndl = dot(n, sdir);
+    if ndl <= 0.02 {
+        return 1.0;  // facing away from the sun: already in shade
+    }
+    let dist_view = -p.z;
+    let far_fade = 1.0 - smoothstep(3500.0, 9000.0, dist_view);
+    if far_fade <= 0.001 {
+        return 1.0;
+    }
+    let steps = i32(u.sun1.z);
+    let len = u.sun1.x;
+    let origin = p + n * (0.008 * dist_view + 3.0) + sdir * (0.004 * dist_view);
+    var up = vec3f(0.0, 1.0, 0.0);
+    if abs(sdir.y) > 0.9 {
+        up = vec3f(1.0, 0.0, 0.0);
+    }
+    let t1 = normalize(cross(sdir, up));
+    let t2 = cross(sdir, t1);
+    let jitter = ign(pix);
+    let jitter2 = ign(pix + vec2u(31u, 7u));
+    let thick = max(u.a.y * 3.0, 260.0);
+    var blocked = 0.0;
+    const RAYS: i32 = 4;
+    for (var r = 0; r < RAYS; r++) {
+        let ang = (f32(r) + jitter2) * 2.39996323 + jitter * TAU;
+        let rad = sqrt((f32(r) + 0.5) / f32(RAYS)) * 0.05;  // angular radius of the sun's disc
+        let dir = normalize(sdir + t1 * (cos(ang) * rad) + t2 * (sin(ang) * rad));
+        var hits = 0.0;
+        for (var s = 0; s < steps; s++) {
+            let f = (f32(s) + fract(jitter + f32(r) * 0.618034)) / f32(steps);
+            let q = origin + dir * (f * f * len + 4.0);
+            if q.z > -u.d.x {
+                break;
+            }
+            let uv = project_uv(q);
+            if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) {
+                break;  // left the screen: nothing more we can know
+            }
+            let d = depth_at_uv(uv);
+            if d <= SKY_DEPTH_EPS {
+                continue;
+            }
+            let diff = -q.z - view_w(uv, d);
+            if diff > -q.z * 0.015 + 4.0 && diff < thick {
+                hits += 1.0;
+            }
+        }
+        blocked += clamp(hits * 0.7, 0.0, 1.0);
+    }
+    let occluded = blocked / f32(RAYS);
+    let face = smoothstep(0.02, 0.3, ndl);
+    return 1.0 - occluded * strength * far_fade * face * (1.0 - u.sun1.y);
 }

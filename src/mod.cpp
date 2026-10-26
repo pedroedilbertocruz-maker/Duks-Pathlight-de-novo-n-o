@@ -77,6 +77,9 @@ ConfigVarHandle g_cvarFlicker = 0;
 ConfigVarHandle g_cvarSparks = 0;
 ConfigVarHandle g_cvarKeepFog = 0;
 ConfigVarHandle g_cvarFogStrength = 0;
+ConfigVarHandle g_cvarSunShadows = 0;
+ConfigVarHandle g_cvarSunStrength = 0;
+ConfigVarHandle g_cvarSunLength = 0;
 
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -152,9 +155,11 @@ struct GiUniforms {
     float fog0[4];  // fog_start, fog_end, fog_enabled, range_center
     float fog1[4];  // fog rgb, fog_strength
     float fogk[12]; // fog range-adjust table (10 used)
+    float sun0[4];  // view-space direction to the sun/moon, strength
+    float sun1[4];  // march length, shadow floor, steps, unused
     float lights[64 * 4];  // view-space pos + radius, then rgb + kind, per light
 };
-static_assert(sizeof(GiUniforms) == 368 + 32 + 80 + 1024, "GiUniforms must match res/common.wgsl");
+static_assert(sizeof(GiUniforms) == 368 + 32 + 80 + 32 + 1024, "GiUniforms must match res/common.wgsl");
 static_assert(sizeof(GiUniforms) % 16 == 0);
 
 struct ComputePayload {
@@ -584,6 +589,7 @@ struct FrameLights {
 };
 FrameLights g_frameLights;
 FogSnapshot g_frameFog;
+SunSnapshot g_frameSun;
 float g_darkAmount = 0.0f;  // smoothed 0..1 "how dark is this place"
 bool g_darkInit = false;
 std::chrono::steady_clock::time_point g_darkTime;
@@ -603,6 +609,10 @@ void prepare_frame_lights(const CameraInfo& camera, const void* gameViewport) {
     collect_fog(gameViewport, g_frameFog);
     if (!get_bool_option(g_cvarKeepFog, true)) {
         g_frameFog.valid = false;
+    }
+    collect_sun(camera.eye, g_frameSun);
+    if (!get_bool_option(g_cvarSunShadows, true)) {
+        g_frameSun.valid = false;
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -736,6 +746,22 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
     u.fog1[2] = fog.color[2];
     u.fog1[3] = percent(g_cvarFogStrength, 100, 0, 200);
     std::memcpy(u.fogk, fog.k, sizeof(fog.k));
+    const SunSnapshot& sun = g_frameSun;
+    std::memset(u.sun0, 0, sizeof(u.sun0));
+    std::memset(u.sun1, 0, sizeof(u.sun1));
+    if (sun.valid) {
+        const float* m = camera.view_from_world;  // column-major; direction: w = 0
+        for (int r = 0; r < 3; ++r) {
+            u.sun0[r] = m[r] * sun.dir[0] + m[4 + r] * sun.dir[1] + m[8 + r] * sun.dir[2];
+        }
+        u.sun0[3] = sun.strength * percent(g_cvarSunStrength, 100, 0, 100);
+        // Low sun -> long shadows: an object of height H needs a ray of H / sin(elevation).
+        const float elev = std::max(sun.dir[1], 0.25f);
+        u.sun1[0] = 1000.0f * percent(g_cvarSunLength, 100, 30, 300) / elev;
+        u.sun1[1] = 0.55f;  // darkest a sun-shadowed surface gets
+        static const float kSunSteps[4] = {10.0f, 14.0f, 18.0f, 24.0f};
+        u.sun1[2] = kSunSteps[std::clamp<int64_t>(get_int_option(g_cvarQuality, 2), 0, 3)];
+    }
     std::memcpy(u.lights, f.lights, sizeof(u.lights));
 }
 
@@ -956,6 +982,14 @@ ModResult build_controls_tab(
     add_number(left, "Fog Strength", g_cvarFogStrength, 0, 200, 10, "%",
         "How strongly the restored fog shows.");
 
+    add_toggle(left, "Sun Shadows", g_cvarSunShadows,
+        "Buildings, trees and rocks cast shadows from the sun (and a fainter moon). They move with "
+        "the in-game clock. Outdoors only.");
+    add_number(left, "Sun Shadow Strength", g_cvarSunStrength, 0, 100, 5, "%",
+        "How dark sun shadows are.");
+    add_number(left, "Sun Shadow Length", g_cvarSunLength, 30, 300, 10, "%",
+        "How far shadows are searched for. Raise it for tall objects.");
+
     svc_ui->pane_add_section(mod_ctx, right, "Denoiser");
     add_number(right, "Denoise Strength", g_cvarDenoise, 0, 100, 5, "%",
         "Spatial edge-aware filtering. Higher is smoother but softer.");
@@ -1077,6 +1111,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_bool_option("swordSparks", true, g_cvarSparks, error);
     if (result == MOD_OK) result = register_bool_option("keepFog", true, g_cvarKeepFog, error);
     if (result == MOD_OK) result = register_int_option("fogStrength", 100, g_cvarFogStrength, error);
+    if (result == MOD_OK) result = register_bool_option("sunShadows", true, g_cvarSunShadows, error);
+    if (result == MOD_OK) result = register_int_option("sunStrength", 70, g_cvarSunStrength, error);
+    if (result == MOD_OK) result = register_int_option("sunLength", 100, g_cvarSunLength, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1170,6 +1207,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarDarkMode = g_cvarDarkness = g_cvarLightGain = g_cvarLightRadius = 0;
     g_cvarShadows = g_cvarFlicker = g_cvarSparks = 0;
     g_cvarKeepFog = g_cvarFogStrength = 0;
+    g_cvarSunShadows = g_cvarSunStrength = g_cvarSunLength = 0;
     g_darkInit = false;
     g_darkAmount = 0.0f;
     g_computeType = g_drawType = 0;

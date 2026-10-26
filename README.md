@@ -31,9 +31,17 @@ Mod nativo para o [Dusklight](https://github.com/TwilitRealm/dusklight) com duas
 | Light Shadows | Objetos bloqueiam a luz e projetam sombras |
 | Flame Flicker | Tremulação das chamas |
 | Sword Sparks | Clarão ao acertar com a espada |
+| Sun Shadows | Casas, árvores e pedras projetam sombras do sol (e da lua, mais fracas à noite). Só em áreas externas |
+| Sun Shadow Strength / Length | Escuridão e comprimento das sombras |
 | Keep Fog | Mantém a névoa do jogo (efeito "Deferred Fog") mesmo com o ambiente escurecido |
 | Fog Strength | Intensidade da névoa restaurada (100% = igual ao jogo original) |
 | Debug View | Mostra "Dynamic light only" e "Darkness scale" para ajustes |
+
+## Sombras do sol
+
+O mod lê a posição do sol e da lua que o jogo calcula pela hora do dia. As sombras giram e
+alongam conforme anoitece e somem quando o sol se põe. São traçadas no espaço da tela, então só
+aparecem para objetos visíveis no quadro. Não há sombras em cavernas e interiores.
 
 ## Névoa (substitui o mod Deferred Fog)
 

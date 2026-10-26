@@ -227,3 +227,39 @@ void collect_fog(const void* gameViewport, FogSnapshot& out) {
     }
     out.valid = true;
 }
+
+void collect_sun(const float eye[3], SunSnapshot& out) {
+    out = SunSnapshot{};
+    dScnKy_env_light_c* env = dKy_getEnvlight();
+    if (env == nullptr || classify_stage(dComIfGp_getStartStageName()) != STAGE_OUTDOORS) {
+        return;
+    }
+    const auto smooth = [](float a, float b, float x) {
+        const float t = clamp01((x - a) / (b - a));
+        return t * t * (3.0f - 2.0f * t);
+    };
+    const auto unit = [](float x, float y, float z, float v[3]) {
+        const float len = std::sqrt(x * x + y * y + z * z);
+        if (!(len > 1.0f)) {
+            return false;
+        }
+        v[0] = x / len;
+        v[1] = y / len;
+        v[2] = z / len;
+        return true;
+    };
+    // The game places the sun at camera + offset and the moon as a pure offset.
+    float sun[3] = {}, moon[3] = {};
+    const bool haveSun = unit(env->sun_pos.x - eye[0], env->sun_pos.y - eye[1],
+        env->sun_pos.z - eye[2], sun);
+    const bool haveMoon = unit(env->moon_pos.x, env->moon_pos.y, env->moon_pos.z, moon);
+    const float sunK = haveSun ? smooth(0.03f, 0.28f, sun[1]) : 0.0f;
+    const float moonK = haveMoon ? 0.4f * smooth(0.05f, 0.3f, moon[1]) * (1.0f - sunK) : 0.0f;
+    const float* src = sunK >= moonK ? sun : moon;
+    out.strength = std::max(sunK, moonK);
+    if (out.strength < 0.01f) {
+        return;
+    }
+    std::memcpy(out.dir, src, sizeof(out.dir));
+    out.valid = true;
+}
