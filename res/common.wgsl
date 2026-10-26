@@ -263,12 +263,12 @@ fn fog_factor(uv_x: f32, z: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------
 
 // True if a view-space point lies inside Link's body (the game draws his own shadow; we skip him).
-fn in_link(q: vec3f) -> bool {
-    let r = u.link0.w;
-    if r <= 0.0 {
+fn in_link(q: vec3f, r: f32, skip: f32) -> bool {
+    if u.link0.w <= 0.0 {
         return false;
     }
-    let a = u.link0.xyz;
+    let ab0 = u.link1.xyz - u.link0.xyz;
+    let a = u.link0.xyz + ab0 * skip;
     let ab = u.link1.xyz - a;
     let t = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-3), 0.0, 1.0);
     let c = a + ab * t;
@@ -280,7 +280,7 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
     if strength <= 0.001 {
         return 1.0;
     }
-    if in_link(p) {
+    if in_link(p, 30.0, 0.2) {  // his body only: never the ground around his feet
         return 1.0;  // Link himself: leave it to the game's own shadow
     }
     let sdir = normalize(u.sun0.xyz);
@@ -327,7 +327,7 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
                 continue;
             }
             let diff = -q.z - view_w(uv, d);
-            if diff > -q.z * 0.015 + 4.0 && diff < thick && !in_link(view_pos(uv, d)) {
+            if diff > -q.z * 0.015 + 4.0 && diff < thick && !in_link(view_pos(uv, d), 45.0, 0.0) {
                 hits += 1.0;
             }
         }
