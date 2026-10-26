@@ -102,16 +102,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
     // Sun colour: warm light on surfaces that face the sun and are not in shadow, cool skylight in
     // cast shadows, plus the rays / bloom. All "screen"-style so nothing blows out.
+    let room_for_rays = vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95));
     var sunlight = vec3f(0.0);
     if u.sun0.w > 0.001 {
         let ndl = clamp(dot(n, normalize(u.sun0.xyz)), 0.0, 1.0);
         let lit = clamp((ss - u.sun1.y) / max(1.0 - u.sun1.y, 1e-3), 0.0, 1.0);
         let room = vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95));
-        let warm = albedo * u.sun2.rgb * (ndl * lit * 0.22 * u.sun2.w * u.sun0.w);
+        let warm = albedo * u.sun2.rgb * (ndl * lit * 0.14 * u.sun2.w * u.sun0.w);
         let cool = albedo * vec3f(0.32, 0.5, 0.95) * ((1.0 - lit) * 0.10 * u.sun2.w * u.sun0.w);
         sunlight = (warm + cool) * room;
     }
-    let rays = sun_rays(in.uv, vec2u(in.position.xy), false);
+    let rays = sun_rays(in.uv, vec2u(in.position.xy), false) * room_for_rays;
     let fog_f = fog_factor(in.uv.x, -p.z);
     let fog_hide = clamp(fog_f * u.fog1.w, 0.0, 1.0);
     let fog_back = (1.0 - m) * fog_f * u.fog1.w * u.fog1.rgb;

@@ -771,7 +771,7 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
         const float elev = std::max(sun.dir[1], 0.25f);
         u.sun1[0] = 1000.0f * percent(g_cvarSunLength, 100, 30, 300) / elev;
         u.sun1[1] = 0.45f;  // darkest a sun-shadowed surface gets
-        static const float kSunSteps[4] = {10.0f, 14.0f, 18.0f, 24.0f};
+        static const float kSunSteps[4] = {8.0f, 10.0f, 14.0f, 20.0f};
         u.sun1[2] = kSunSteps[std::clamp<int64_t>(get_int_option(g_cvarQuality, 2), 0, 3)];
         {
             // Light colour from the sun's height: gold at dawn/dusk, warm white at noon, blue moon.
@@ -782,8 +782,8 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
                 c[0] = 0.45f; c[1] = 0.58f; c[2] = 1.0f;
             } else if (get_bool_option(g_cvarSunTod, true)) {
                 c[0] = 1.0f;
-                c[1] = 0.50f + 0.43f * k;
-                c[2] = 0.22f + 0.60f * k;
+                c[1] = 0.72f + 0.24f * k;
+                c[2] = 0.50f + 0.40f * k;
             }
             for (int r = 0; r < 3; ++r) u.sun2[r] = c[r];
             u.sun2[3] = percent(g_cvarSunWarmth, 100, 0, 200) * (sun.isMoon ? 0.35f : 1.0f);
@@ -1162,9 +1162,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_bool_option("sunShadows", true, g_cvarSunShadows, error);
     if (result == MOD_OK) result = register_int_option("sunStrength", 85, g_cvarSunStrength, error);
     if (result == MOD_OK) result = register_int_option("sunLength", 100, g_cvarSunLength, error);
-    if (result == MOD_OK) result = register_int_option("sunRays", 100, g_cvarSunRays, error);
-    if (result == MOD_OK) result = register_int_option("sunWarmth", 100, g_cvarSunWarmth, error);
-    if (result == MOD_OK) result = register_int_option("sunBloom", 100, g_cvarSunBloom, error);
+    if (result == MOD_OK) result = register_int_option("sunRays", 50, g_cvarSunRays, error);
+    if (result == MOD_OK) result = register_int_option("sunWarmth", 70, g_cvarSunWarmth, error);
+    if (result == MOD_OK) result = register_int_option("sunBloom", 60, g_cvarSunBloom, error);
     if (result == MOD_OK) result = register_bool_option("sunTod", true, g_cvarSunTod, error);
     if (result != MOD_OK) {
         return result;

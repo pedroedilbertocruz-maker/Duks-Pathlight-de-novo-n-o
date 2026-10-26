@@ -306,7 +306,7 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
     let jitter2 = ign(pix + vec2u(31u, 7u));
     let thick = max(u.a.y * 3.0, 260.0);
     var blocked = 0.0;
-    const RAYS: i32 = 4;
+    const RAYS: i32 = 3;
     for (var r = 0; r < RAYS; r++) {
         let ang = (f32(r) + jitter2) * 2.39996323 + jitter * TAU;
         let rad = sqrt((f32(r) + 0.5) / f32(RAYS)) * 0.03;  // angular radius of the sun's disc
@@ -370,11 +370,11 @@ fn sun_rays(uv: vec2f, pix: vec2u, here_is_sky: bool) -> vec3f {
 
     // Bloom: tight core + wide halo, strongest on sky, faint over geometry.
     let glow = 0.55 * exp(-dist * 22.0) + 0.22 * exp(-dist * 5.0);
-    let bloom = col * glow * u.sun3.y * u.sun0.w * select(0.10, 0.5, here_is_sky);
+    let bloom = col * glow * u.sun3.y * u.sun0.w * select(0.0, 0.5, here_is_sky);
 
     var rays = vec3f(0.0);
     if u.sun3.x > 0.001 {
-        const N: i32 = 24;
+        const N: i32 = 12;
         let jitter = ign(pix);
         var sum = 0.0;
         var decay = 1.0;
@@ -395,7 +395,10 @@ fn sun_rays(uv: vec2f, pix: vec2u, here_is_sky: bool) -> vec3f {
         }
         // Fade by how far the pixel is from the sun, so far-away pixels don't get a flat veil.
         let reach = exp(-dist * 1.6);
-        rays = col * (sum / f32(N)) * 0.55 * reach * u.sun3.x * u.sun0.w;
+        // Over geometry the shafts are only a faint haze; the strong part belongs to the sky.
+        let on_geo = select(0.18, 1.0, here_is_sky);
+        rays = mix(col, vec3f(1.0), 0.35) * (sum / f32(N)) * 0.45 * reach * u.sun3.x * u.sun0.w * on_geo;
     }
-    return min(bloom + rays, vec3f(0.9));
+    let total = bloom + rays;
+    return min(total, select(vec3f(0.12), vec3f(0.8), here_is_sky));
 }
