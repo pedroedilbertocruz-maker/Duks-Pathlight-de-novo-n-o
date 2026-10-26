@@ -87,7 +87,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     // Light reaching the surface is tinted by its albedo; "screen"-style so it never blows out.
     let direct = albedo * lf.rgb * u.l0.y * (vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95)));
     // Same energy-conserving add for the bounced light, relative to the darkened surface.
-    let indirect = albedo * gi.rgb * u.a.z * (vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95)));
+    var indirect = albedo * gi.rgb * u.a.z * (vec3f(1.0) - clamp(base, vec3f(0.0), vec3f(0.95)));
+    // Soft knee: huge emitters (lava fields) must not blow surfaces out to white.
+    indirect = indirect / (vec3f(1.0) + vec3f(max(indirect.r, max(indirect.g, indirect.b)) * 1.2));
     let occlusion = clamp(gi.a * u.b.y, 0.0, 0.95);
 
     switch u.i.w {

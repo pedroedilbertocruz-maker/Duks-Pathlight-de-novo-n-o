@@ -193,7 +193,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3u) {
             let mx = max(c.r, max(c.g, c.b));
             let chroma = (mx - min(c.r, min(c.g, c.b))) / max(mx, 1e-3);
             let emit = smoothstep(0.58, 0.92, mx) * smoothstep(0.25, 0.65, chroma);
-            l += (c / max(mx, 1e-3)) * (emit * u.d.w * 3.0);
+            l += (c / max(mx, 1e-3)) * (emit * u.d.w * 0.7);
             l = min(l, vec3f(4.0));
             let fade = 1.0 - smoothstep(0.7, 1.0, hit.dist / u.a.x);
             radiance += l * fade;

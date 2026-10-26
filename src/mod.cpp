@@ -1069,7 +1069,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_int_option("colorBleeding", 100, g_cvarBleed, error);
     if (result == MOD_OK) result = register_int_option("skyLight", 50, g_cvarSky, error);
     if (result == MOD_OK) result = register_int_option("emissiveBoost", 50, g_cvarEmissive, error);
-    if (result == MOD_OK) result = register_int_option("emissiveLight", 100, g_cvarEmissiveColor, error);
+    if (result == MOD_OK) result = register_int_option("emissiveLight", 40, g_cvarEmissiveColor, error);
     if (result == MOD_OK) result = register_int_option("denoise", 50, g_cvarDenoise, error);
     if (result == MOD_OK) result = register_int_option("temporalFrames", 24, g_cvarHistory, error);
     if (result == MOD_OK) result = register_int_option("debugView", 0, g_cvarDebug, error);
