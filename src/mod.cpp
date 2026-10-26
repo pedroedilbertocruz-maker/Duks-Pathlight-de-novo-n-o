@@ -80,6 +80,10 @@ ConfigVarHandle g_cvarFogStrength = 0;
 ConfigVarHandle g_cvarSunShadows = 0;
 ConfigVarHandle g_cvarSunStrength = 0;
 ConfigVarHandle g_cvarSunLength = 0;
+ConfigVarHandle g_cvarSunRays = 0;
+ConfigVarHandle g_cvarSunWarmth = 0;
+ConfigVarHandle g_cvarSunBloom = 0;
+ConfigVarHandle g_cvarSunTod = 0;
 
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -157,9 +161,13 @@ struct GiUniforms {
     float fogk[12]; // fog range-adjust table (10 used)
     float sun0[4];  // view-space direction to the sun/moon, strength
     float sun1[4];  // march length, shadow floor, steps, unused
+    float sun2[4];  // sun/moon light colour rgb (time of day), warmth
+    float sun3[4];  // god-ray strength, bloom strength, unused, unused
+    float link0[4]; // Link's feet-segment start (view space) + exclusion radius (0 = none)
+    float link1[4]; // Link's segment end (view space)
     float lights[64 * 4];  // view-space pos + radius, then rgb + kind, per light
 };
-static_assert(sizeof(GiUniforms) == 368 + 32 + 80 + 32 + 1024, "GiUniforms must match res/common.wgsl");
+static_assert(sizeof(GiUniforms) == 368 + 32 + 80 + 32 + 32 + 32 + 1024, "GiUniforms must match res/common.wgsl");
 static_assert(sizeof(GiUniforms) % 16 == 0);
 
 struct ComputePayload {
@@ -749,6 +757,10 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
     const SunSnapshot& sun = g_frameSun;
     std::memset(u.sun0, 0, sizeof(u.sun0));
     std::memset(u.sun1, 0, sizeof(u.sun1));
+    std::memset(u.sun2, 0, sizeof(u.sun2));
+    std::memset(u.sun3, 0, sizeof(u.sun3));
+    std::memset(u.link0, 0, sizeof(u.link0));
+    std::memset(u.link1, 0, sizeof(u.link1));
     if (sun.valid) {
         const float* m = camera.view_from_world;  // column-major; direction: w = 0
         for (int r = 0; r < 3; ++r) {
@@ -758,9 +770,36 @@ void fill_uniforms(GiUniforms& u, const CameraInfo& camera, uint32_t giWidth, ui
         // Low sun -> long shadows: an object of height H needs a ray of H / sin(elevation).
         const float elev = std::max(sun.dir[1], 0.25f);
         u.sun1[0] = 1000.0f * percent(g_cvarSunLength, 100, 30, 300) / elev;
-        u.sun1[1] = 0.55f;  // darkest a sun-shadowed surface gets
+        u.sun1[1] = 0.45f;  // darkest a sun-shadowed surface gets
         static const float kSunSteps[4] = {10.0f, 14.0f, 18.0f, 24.0f};
         u.sun1[2] = kSunSteps[std::clamp<int64_t>(get_int_option(g_cvarQuality, 2), 0, 3)];
+        {
+            // Light colour from the sun's height: gold at dawn/dusk, warm white at noon, blue moon.
+            const float h = std::clamp(sun.dir[1], 0.0f, 1.0f);
+            const float k = std::clamp((h - 0.05f) / 0.5f, 0.0f, 1.0f);
+            float c[3] = {1.0f, 0.93f, 0.82f};
+            if (sun.isMoon) {
+                c[0] = 0.45f; c[1] = 0.58f; c[2] = 1.0f;
+            } else if (get_bool_option(g_cvarSunTod, true)) {
+                c[0] = 1.0f;
+                c[1] = 0.50f + 0.43f * k;
+                c[2] = 0.22f + 0.60f * k;
+            }
+            for (int r = 0; r < 3; ++r) u.sun2[r] = c[r];
+            u.sun2[3] = percent(g_cvarSunWarmth, 100, 0, 200) * (sun.isMoon ? 0.35f : 1.0f);
+            u.sun3[0] = percent(g_cvarSunRays, 100, 0, 300) * (sun.isMoon ? 0.3f : 1.0f);
+            u.sun3[1] = percent(g_cvarSunBloom, 100, 0, 200) * (sun.isMoon ? 0.5f : 1.0f);
+        }
+        if (sun.linkValid) {
+            // Link's body as a vertical segment (feet+20 .. head+10); the game already draws his shadow.
+            const float a[3] = {sun.linkPos[0], sun.linkPos[1] + 20.0f, sun.linkPos[2]};
+            const float b[3] = {sun.linkPos[0], sun.linkPos[1] + 170.0f, sun.linkPos[2]};
+            for (int r = 0; r < 3; ++r) {
+                u.link0[r] = m[r] * a[0] + m[4 + r] * a[1] + m[8 + r] * a[2] + m[12 + r];
+                u.link1[r] = m[r] * b[0] + m[4 + r] * b[1] + m[8 + r] * b[2] + m[12 + r];
+            }
+            u.link0[3] = 75.0f;
+        }
     }
     std::memcpy(u.lights, f.lights, sizeof(u.lights));
 }
@@ -987,6 +1026,15 @@ ModResult build_controls_tab(
         "the in-game clock. Outdoors only.");
     add_number(left, "Sun Shadow Strength", g_cvarSunStrength, 0, 100, 5, "%",
         "How dark sun shadows are.");
+    add_number(left, "Sun Rays", g_cvarSunRays, 0, 300, 10, "%",
+        "Visible light shafts from the sun through trees and buildings (needs the sun in front of "
+        "the camera).");
+    add_number(left, "Sun Warmth", g_cvarSunWarmth, 0, 200, 10, "%",
+        "Warm sunlight on lit surfaces and cool skylight in shadow.");
+    add_number(left, "Sun Bloom", g_cvarSunBloom, 0, 200, 10, "%",
+        "Glow around the sun.");
+    add_toggle(left, "Time-of-Day Colour", g_cvarSunTod,
+        "Sunlight turns golden at dawn and dusk. The moon is blue.");
     add_number(left, "Sun Shadow Length", g_cvarSunLength, 30, 300, 10, "%",
         "How far shadows are searched for. Raise it for tall objects.");
 
@@ -1112,8 +1160,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result == MOD_OK) result = register_bool_option("keepFog", true, g_cvarKeepFog, error);
     if (result == MOD_OK) result = register_int_option("fogStrength", 100, g_cvarFogStrength, error);
     if (result == MOD_OK) result = register_bool_option("sunShadows", true, g_cvarSunShadows, error);
-    if (result == MOD_OK) result = register_int_option("sunStrength", 70, g_cvarSunStrength, error);
+    if (result == MOD_OK) result = register_int_option("sunStrength", 85, g_cvarSunStrength, error);
     if (result == MOD_OK) result = register_int_option("sunLength", 100, g_cvarSunLength, error);
+    if (result == MOD_OK) result = register_int_option("sunRays", 100, g_cvarSunRays, error);
+    if (result == MOD_OK) result = register_int_option("sunWarmth", 100, g_cvarSunWarmth, error);
+    if (result == MOD_OK) result = register_int_option("sunBloom", 100, g_cvarSunBloom, error);
+    if (result == MOD_OK) result = register_bool_option("sunTod", true, g_cvarSunTod, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1208,6 +1260,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarShadows = g_cvarFlicker = g_cvarSparks = 0;
     g_cvarKeepFog = g_cvarFogStrength = 0;
     g_cvarSunShadows = g_cvarSunStrength = g_cvarSunLength = 0;
+    g_cvarSunRays = g_cvarSunWarmth = g_cvarSunBloom = g_cvarSunTod = 0;
     g_darkInit = false;
     g_darkAmount = 0.0f;
     g_computeType = g_drawType = 0;

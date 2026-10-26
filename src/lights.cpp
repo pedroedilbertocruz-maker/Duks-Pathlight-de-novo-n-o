@@ -261,5 +261,13 @@ void collect_sun(const float eye[3], SunSnapshot& out) {
         return;
     }
     std::memcpy(out.dir, src, sizeof(out.dir));
+    out.isMoon = src == moon;
     out.valid = true;
+    const daAlink_c* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (link != nullptr) {
+        out.linkValid = true;
+        out.linkPos[0] = link->current.pos.x;
+        out.linkPos[1] = link->current.pos.y;
+        out.linkPos[2] = link->current.pos.z;
+    }
 }

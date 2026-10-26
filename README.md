@@ -32,6 +32,10 @@ Mod nativo para o [Dusklight](https://github.com/TwilitRealm/dusklight) com duas
 | Flame Flicker | Tremulação das chamas |
 | Sword Sparks | Clarão ao acertar com a espada |
 | Sun Shadows | Casas, árvores e pedras projetam sombras do sol (e da lua, mais fracas à noite). Só em áreas externas |
+| Sun Rays | Feixes de luz (god rays) do sol por entre árvores e casas. Precisam do sol na frente da câmera |
+| Sun Warmth | Luz quente do sol nas superfícies iluminadas e luz fria do céu nas sombras |
+| Sun Bloom | Brilho ao redor do sol |
+| Time-of-Day Colour | Luz dourada ao amanhecer e entardecer; lua azulada |
 | Sun Shadow Strength / Length | Escuridão e comprimento das sombras |
 | Keep Fog | Mantém a névoa do jogo (efeito "Deferred Fog") mesmo com o ambiente escurecido |
 | Fog Strength | Intensidade da névoa restaurada (100% = igual ao jogo original) |

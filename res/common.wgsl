@@ -26,6 +26,10 @@ struct Uniforms {
     fogk: array<vec4f, 3>, // fog range-adjust table (10 values, already /64 and pair-swapped)
     sun0: vec4f,   // direction TO the sun/moon in view space (xyz), strength 0..1 (0 = off)
     sun1: vec4f,   // march length (world units), shadow floor (darkest lit fraction), steps, unused
+    sun2: vec4f,   // sun/moon light colour rgb, warmth
+    sun3: vec4f,   // god-ray strength, bloom strength, unused, unused
+    link0: vec4f,  // Link's body segment start (view space), exclusion radius (0 = off)
+    link1: vec4f,  // Link's body segment end (view space)
     // Scene lights in VIEW space: [2k] = pos.xyz, radius ; [2k+1] = rgb (flicker applied), kind
     lights: array<vec4f, 64>,
 }
@@ -258,10 +262,26 @@ fn fog_factor(uv_x: f32, z: f32) -> f32 {
 // the sun are darkened (the others already are in shade). Returns 1 = lit .. sun1.y = shadowed.
 // ---------------------------------------------------------------------------------------------
 
+// True if a view-space point lies inside Link's body (the game draws his own shadow; we skip him).
+fn in_link(q: vec3f) -> bool {
+    let r = u.link0.w;
+    if r <= 0.0 {
+        return false;
+    }
+    let a = u.link0.xyz;
+    let ab = u.link1.xyz - a;
+    let t = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-3), 0.0, 1.0);
+    let c = a + ab * t;
+    return dot(q - c, q - c) < r * r;
+}
+
 fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
     let strength = u.sun0.w;
     if strength <= 0.001 {
         return 1.0;
+    }
+    if in_link(p) {
+        return 1.0;  // Link himself: leave it to the game's own shadow
     }
     let sdir = normalize(u.sun0.xyz);
     let ndl = dot(n, sdir);
@@ -289,7 +309,7 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
     const RAYS: i32 = 4;
     for (var r = 0; r < RAYS; r++) {
         let ang = (f32(r) + jitter2) * 2.39996323 + jitter * TAU;
-        let rad = sqrt((f32(r) + 0.5) / f32(RAYS)) * 0.05;  // angular radius of the sun's disc
+        let rad = sqrt((f32(r) + 0.5) / f32(RAYS)) * 0.03;  // angular radius of the sun's disc
         let dir = normalize(sdir + t1 * (cos(ang) * rad) + t2 * (sin(ang) * rad));
         var hits = 0.0;
         for (var s = 0; s < steps; s++) {
@@ -307,7 +327,7 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
                 continue;
             }
             let diff = -q.z - view_w(uv, d);
-            if diff > -q.z * 0.015 + 4.0 && diff < thick {
+            if diff > -q.z * 0.015 + 4.0 && diff < thick && !in_link(view_pos(uv, d)) {
                 hits += 1.0;
             }
         }
@@ -316,4 +336,66 @@ fn sun_shadow(p: vec3f, n: vec3f, pix: vec2u) -> f32 {
     let occluded = blocked / f32(RAYS);
     let face = smoothstep(0.02, 0.3, ndl);
     return 1.0 - occluded * strength * far_fade * face * (1.0 - u.sun1.y);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Sun rays (crepuscular "god rays") and bloom. Radial march from the pixel toward the sun's screen
+// position: sky samples carry light, geometry blocks it, so trees and roofs cut the glow into shafts.
+// Returns additive rgb. Works for sky pixels too (that is the bloom around the sun).
+// ---------------------------------------------------------------------------------------------
+
+fn sun_screen() -> vec3f {
+    // xy = uv of the sun, z = 1 if it is in front of the camera.
+    let d = normalize(u.sun0.xyz);
+    if d.z > -0.05 {
+        return vec3f(0.5, 0.5, 0.0);
+    }
+    let uv = project_uv(d * 10000.0);
+    return vec3f(uv, 1.0);
+}
+
+fn sun_rays(uv: vec2f, pix: vec2u, here_is_sky: bool) -> vec3f {
+    if u.sun0.w <= 0.001 || (u.sun3.x <= 0.001 && u.sun3.y <= 0.001) {
+        return vec3f(0.0);
+    }
+    let s = sun_screen();
+    if s.z < 0.5 {
+        return vec3f(0.0);
+    }
+    let aspect = u.full.x / max(u.full.y, 1.0);
+    let to_sun = s.xy - uv;
+    let dist = length(vec2f(to_sun.x * aspect, to_sun.y));
+    let col = u.sun2.rgb;
+
+    // Bloom: tight core + wide halo, strongest on sky, faint over geometry.
+    let glow = 0.55 * exp(-dist * 22.0) + 0.22 * exp(-dist * 5.0);
+    let bloom = col * glow * u.sun3.y * u.sun0.w * select(0.10, 0.5, here_is_sky);
+
+    var rays = vec3f(0.0);
+    if u.sun3.x > 0.001 {
+        const N: i32 = 24;
+        let jitter = ign(pix);
+        var sum = 0.0;
+        var decay = 1.0;
+        for (var i = 0; i < N; i++) {
+            let f = (f32(i) + jitter) / f32(N);
+            let q = uv + to_sun * f;
+            if any(q < vec2f(0.0)) || any(q > vec2f(1.0)) {
+                decay *= 0.94;
+                continue;
+            }
+            let dq = depth_at_uv(q);
+            let nq = normal_at_uv(q);
+            if is_sky(dq, nq) {
+                let dd = length(vec2f((s.xy.x - q.x) * aspect, s.xy.y - q.y));
+                sum += decay * (0.25 + 1.2 * exp(-dd * 6.0));
+            }
+            decay *= 0.94;
+        }
+        // Fade by how far the pixel is from the sun, so far-away pixels don't get a flat veil.
+        let reach = exp(-dist * 1.6);
+        rays = col * (sum / f32(N)) * 0.55 * reach * u.sun3.x * u.sun0.w;
+    }
+    return min(bloom + rays, vec3f(0.9));
 }
